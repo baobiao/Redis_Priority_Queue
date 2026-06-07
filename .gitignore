@@ -1,0 +1,14 @@
+# Universal
+.DS_Store
+Thumbs.db
+*.tmp
+*.swp
+*.log
+.env*
+.vscode/
+.idea/
+
+# Test / harness scratch
+tests/.artifacts/
+*.rdb
+dump.rdb
