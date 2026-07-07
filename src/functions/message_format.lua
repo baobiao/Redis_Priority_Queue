@@ -6,6 +6,7 @@
 -- Spec      : specs/001-message-format/spec.md
 -- Plan      : specs/001-message-format/plan.md
 -- Contracts : specs/001-message-format/contracts/functions.md
+-- Enqueue   : specs/002-enqueue/spec.md (msgfmt_enqueue; contracts/functions.md)
 --
 -- A message is stored as a single Redis/Valkey Hash (one field per attribute)
 -- at a caller-supplied key (KEYS[1]). The same source runs unmodified on
@@ -196,6 +197,72 @@ local function msgfmt_validate(keys, args)
   return redis.status_reply('VALID')
 end
 
+-- ---------------------------------------------------------------------------
+-- msgfmt_enqueue  (WRITE)
+--   KEYS[1] = priority-queue Sorted Set ; KEYS[2] = message Hash (same slot).
+--   ARGV[1] = id (unique, non-empty) ; ARGV[2] = sequence (integer 0..2^53) ;
+--   ARGV[3..] = optional field/value pairs (same set as msgfmt_create).
+--   Validates + stores the message and indexes it by Priority in one atomic
+--   call:  score = message Priority ;  member = %020.0f(sequence) .. ':' .. id
+--   (fixed-width zero-pad so lexical member order == FIFO among equal scores).
+--   Fail-before-write: on any error nothing is written to either key.
+-- ---------------------------------------------------------------------------
+local function msgfmt_enqueue(keys, args)
+  if #keys ~= 2 then
+    return redis.error_reply('MSGFMT EKEYS: exactly two keys required')
+  end
+  local id = args[1]
+  if id == nil or id == '' then
+    return redis.error_reply('MSGFMT EID: id must be a non-empty string')
+  end
+  local seq = tonumber(args[2])
+  if not is_int(seq) or seq < 0 or seq > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ESEQ: sequence must be a non-negative integer')
+  end
+
+  -- Field pairs are ARGV[3..]; reuse the Feature 001 builder (defaults + validation).
+  local fields = {}
+  for i = 3, #args do
+    fields[#fields + 1] = args[i]
+  end
+  local hset, err = build_message(fields)
+  if err then
+    return redis.error_reply('MSGFMT ' .. err)
+  end
+
+  -- score = the message's Priority (from the built, encoded field list).
+  local score
+  for i = 1, #hset, 2 do
+    if hset[i] == 'Priority' then
+      score = hset[i + 1]
+      break
+    end
+  end
+
+  local member = string.format('%020.0f', seq) .. ':' .. id
+
+  -- Fail-before-write preconditions: reject conflicts and wrong-type targets.
+  if redis.call('EXISTS', keys[2]) == 1 then
+    return redis.error_reply('MSGFMT EEXISTS: message location occupied')
+  end
+  if redis.call('EXISTS', keys[1]) == 1 then
+    local t = redis.call('TYPE', keys[1])
+    if t.ok ~= 'zset' then
+      return redis.error_reply('MSGFMT EMALFORMED: queue is not a sorted set')
+    end
+  end
+  if redis.call('ZSCORE', keys[1], member) ~= false then
+    return redis.error_reply('MSGFMT EQDUP: already enqueued')
+  end
+
+  -- Write: store the message Hash, then index it in the queue Sorted Set.
+  local cmd = { 'HSET', keys[2] }
+  for _, v in ipairs(hset) do cmd[#cmd + 1] = v end
+  redis.call(unpack(cmd))
+  redis.call('ZADD', keys[1], score, member)
+  return redis.status_reply('OK')
+end
+
 redis.register_function('msgfmt_create', msgfmt_create)
 redis.register_function{
   function_name = 'msgfmt_read',
@@ -207,3 +274,4 @@ redis.register_function{
   callback      = msgfmt_validate,
   flags         = { 'no-writes' },
 }
+redis.register_function('msgfmt_enqueue', msgfmt_enqueue)

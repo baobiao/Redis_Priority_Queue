@@ -1,7 +1,23 @@
 <!--
 SYNC IMPACT REPORT
 ==================
-Version change: 1.0.0 → 1.1.0
+Version change: 1.1.0 → 1.2.0
+Bump rationale: MINOR — added Principle X (Documentation Currency): the developer
+  documentation (README.md, docs/schema.md, docs/functions.md) MUST be kept current with
+  every feature change. New principle; none removed or redefined.
+
+Modified in 1.2.0:
+  - Added Principle X (Documentation Currency).
+  - Development Workflow & Quality Gates: added a documentation-currency check at PR review.
+
+Templates requiring updates:
+  ✅ .specify/templates/plan-template.md      — no change (Constitution Check gate defers dynamically)
+  ✅ .specify/templates/spec-template.md      — no change (domain-agnostic)
+  ✅ .specify/templates/tasks-template.md     — no change (domain-agnostic)
+  ✅ .specify/templates/checklist-template.md — no change (generic)
+
+------------------------------------------------------------
+Prior entry — Version change: 1.0.0 → 1.1.0
 Bump rationale: MINOR — added mandatory local unit-testing methodology (Docker-based
   Redis and Valkey container images) to Principle IX and the Development Workflow &
   Quality Gates section. New guidance, no principle removed or redefined.
@@ -183,6 +199,23 @@ cycle above against each.
 
 **Rationale**: Cluster mode and version differences are where portability breaks.
 
+### X. Documentation Currency
+
+Every change to a function's behavior, interface, or the message/queue schema MUST update the
+affected documentation in the same change. The developer documentation — the project
+`README.md`, `docs/schema.md` (message schema and native data types), and `docs/functions.md`
+(every library function) — MUST accurately reflect the implemented library at all times. A new
+feature MUST add or update its documentation as part of the feature; documentation MUST NOT be
+deferred to a later change.
+
+**Check**: PR review MUST confirm that any change altering documented behavior (fields,
+functions, error replies, commands, native types, or how to run the tests) includes the
+corresponding documentation update; a behavioral change that leaves documentation stale or
+missing fails the gate.
+
+**Rationale**: Documentation that drifts from the code misleads the developers adopting and
+maintaining the library; updating it in the same change keeps it trustworthy.
+
 ## Technology Constraints
 
 - **Language**: Lua, targeting the engine-embedded interpreter (Lua 5.1 semantics). No
@@ -198,6 +231,9 @@ cycle above against each.
 - The Spec-Kit phases are enforced in order. `/speckit.clarify` is REQUIRED before
   `/speckit.plan`, and `/speckit.analyze` is REQUIRED before `/speckit.implement`.
 - Every pull request MUST be reviewed for constitution compliance.
+- **Documentation currency**: any pull request that changes documented behavior MUST update the
+  affected documentation (`README.md`, `docs/schema.md`, `docs/functions.md`) in the same pull
+  request (Principle X).
 - **Local testing**: Developers MUST run unit tests against real engines before opening a
   PR. The harness spins up the Redis and Valkey container images via the Docker CLI,
   connects with a Redis client, loads the Lua function library with `FUNCTION LOAD`, and
@@ -222,4 +258,4 @@ cycle above against each.
 - Compliance is reviewed at the `/speckit.plan` and `/speckit.implement` gates;
   violations block progress until resolved or the constitution is formally amended.
 
-**Version**: 1.1.0 | **Ratified**: 2026-05-30 | **Last Amended**: 2026-05-30
+**Version**: 1.2.0 | **Ratified**: 2026-05-30 | **Last Amended**: 2026-07-07
