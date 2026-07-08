@@ -7,6 +7,7 @@
 -- Plan      : specs/001-message-format/plan.md
 -- Contracts : specs/001-message-format/contracts/functions.md
 -- Enqueue   : specs/002-enqueue/spec.md (msgfmt_enqueue; contracts/functions.md)
+-- Dequeue   : specs/003-dequeue/spec.md (msgfmt_dequeue/ack/nack; contracts/functions.md)
 --
 -- A message is stored as a single Redis/Valkey Hash (one field per attribute)
 -- at a caller-supplied key (KEYS[1]). The same source runs unmodified on
@@ -51,6 +52,18 @@ local MAX_SAFE_INT = 9007199254740992 -- 2^53; exact-integer ceiling for Lua dou
 -- Is n a finite value with an exact integer representation?
 local function is_int(n)
   return n ~= nil and n == n and n ~= math.huge and n ~= -math.huge and math.floor(n) == n
+end
+
+-- Extract the cluster hash tag: the substring between the first '{' and the
+-- first '}' after it. Returns nil when there is no non-empty {...} tag. Used by
+-- msgfmt_dequeue to verify the queue key and the message-key prefix co-locate to
+-- one slot before it constructs per-message keys (Principle IV, as amended v2.0.0).
+local function hash_tag(key)
+  local open = string.find(key, '{', 1, true)
+  if not open then return nil end
+  local close = string.find(key, '}', open + 1, true)
+  if not close or close == open + 1 then return nil end
+  return string.sub(key, open + 1, close - 1)
 end
 
 -- Encode a supplied value for storage, validating per field.
@@ -263,6 +276,187 @@ local function msgfmt_enqueue(keys, args)
   return redis.status_reply('OK')
 end
 
+-- ---------------------------------------------------------------------------
+-- msgfmt_dequeue  (WRITE)
+--   KEYS[1] = priority-queue Sorted Set ; KEYS[2] = message-key prefix (same tag).
+--   ARGV[1] = now (epoch ms, integer >=0) ; ARGV[2] = timeout (ms, integer >=1) ;
+--   ARGV[3] = max_scan (optional, integer >=0; 0/absent = unbounded).
+--   Selects the front AVAILABLE message (DirtyBit=0, or DirtyBit=1 with an expired
+--   lease: now-ReadDateTime >= timeout), marks it in-flight (DirtyBit=1,
+--   ReadDateTime=now, ReadAttempts+1) and returns its Payload plus a handle
+--   (id, member, ReadAttempts = fencing token, ReadDateTime, Priority). Returns a
+--   null reply when nothing is available. The winning message Hash is reached at
+--   KEYS[2] .. id (the sanctioned same-slot construction). Fail-before-write.
+-- ---------------------------------------------------------------------------
+local function msgfmt_dequeue(keys, args)
+  if #keys ~= 2 then
+    return redis.error_reply('MSGFMT EKEYS: exactly two keys required')
+  end
+  local queue = keys[1]
+  local prefix = keys[2]
+
+  local now = tonumber(args[1])
+  if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ENOW: now must be a non-negative integer')
+  end
+  local timeout = tonumber(args[2])
+  if not is_int(timeout) or timeout < 1 or timeout > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ETMO: timeout must be a positive integer')
+  end
+  local max_scan = 0
+  if args[3] ~= nil then
+    max_scan = tonumber(args[3])
+    if not is_int(max_scan) or max_scan < 0 or max_scan > MAX_SAFE_INT then
+      return redis.error_reply('MSGFMT ESCAN: max_scan must be a non-negative integer')
+    end
+  end
+
+  -- Co-location: queue and message-key prefix must share one hash tag so every
+  -- constructed KEYS[2]..id lands in the queue's slot (Principle IV / cluster-safe).
+  local qtag = hash_tag(queue)
+  local ptag = hash_tag(prefix)
+  if qtag == nil or ptag == nil or qtag ~= ptag then
+    return redis.error_reply('MSGFMT ETAG: queue and message-key prefix must share one hash tag')
+  end
+
+  if redis.call('EXISTS', queue) == 0 then
+    return false -- empty queue -> nothing available (RESP null)
+  end
+  local qt = redis.call('TYPE', queue)
+  if qt.ok ~= 'zset' then
+    return redis.error_reply('MSGFMT EMALFORMED: queue is not a sorted set')
+  end
+
+  -- Walk the front ascending (lowest score first, ties by member byte order = FIFO).
+  -- When max_scan is set, fetch only that many front members (index-range ZRANGE
+  -- has no LIMIT option, so bound the fetch itself).
+  local stop = -1
+  if max_scan > 0 then stop = max_scan - 1 end
+  local members = redis.call('ZRANGE', queue, 0, stop)
+
+  for _, member in ipairs(members) do
+    -- id = text after the first ':' (the sequence is a fixed 20-digit prefix).
+    local colon = string.find(member, ':', 1, true)
+    local id = colon and string.sub(member, colon + 1) or member
+    local mkey = prefix .. id
+
+    if redis.call('EXISTS', mkey) == 0 then
+      -- Dangling member (message Hash deleted out of band): clean up and skip.
+      redis.call('ZREM', queue, member)
+    else
+      local mt = redis.call('TYPE', mkey)
+      if mt.ok ~= 'hash' then
+        return redis.error_reply('MSGFMT EMALFORMED: message ' .. mkey .. ' is not a hash')
+      end
+      local vals = redis.call('HMGET', mkey,
+        'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload')
+      if vals[1] == false or vals[2] == false or vals[3] == false then
+        return redis.error_reply('MSGFMT EMALFORMED: message ' .. mkey .. ' missing lease field')
+      end
+      local available = false
+      if vals[1] == '0' then
+        available = true
+      elseif vals[1] == '1' then
+        local rdt = tonumber(vals[2])
+        if rdt ~= nil and (now - rdt) >= timeout then
+          available = true -- expired lease -> reclaim
+        end
+      end
+      if available then
+        local new_ra = redis.call('HINCRBY', mkey, 'ReadAttempts', 1)
+        redis.call('HSET', mkey, 'DirtyBit', '1', 'ReadDateTime', string.format('%.0f', now))
+        return {
+          'id',           id,
+          'member',       member,
+          'ReadAttempts', new_ra, -- fencing token
+          'ReadDateTime', now,
+          'Priority',     tonumber(vals[4]),
+          'Payload',      vals[5],
+        }
+      end
+    end
+  end
+  return false -- nothing available within the scan (RESP null)
+end
+
+-- ---------------------------------------------------------------------------
+-- msgfmt_ack  (WRITE)
+--   KEYS[1] = priority-queue Sorted Set ; KEYS[2] = message Hash.
+--   ARGV[1] = member (from the handle, for ZREM) ; ARGV[2] = token (fencing).
+--   On a valid current lease (DirtyBit=1 and ReadAttempts == token) removes the
+--   member (ZREM) and deletes the Hash (DEL). Idempotent NOOP if already gone.
+--   Fenced: a superseded lease is rejected (EFENCED) with no side effects.
+-- ---------------------------------------------------------------------------
+local function msgfmt_ack(keys, args)
+  if #keys ~= 2 then
+    return redis.error_reply('MSGFMT EKEYS: exactly two keys required')
+  end
+  local queue = keys[1]
+  local mkey = keys[2]
+  local member = args[1]
+  local token = tonumber(args[2])
+  if member == nil or member == '' or not is_int(token) then
+    return redis.error_reply('MSGFMT EARGS: member and token required')
+  end
+  if redis.call('EXISTS', mkey) == 0 then
+    return redis.status_reply('NOOP') -- already settled
+  end
+  local mt = redis.call('TYPE', mkey)
+  if mt.ok ~= 'hash' then
+    return redis.error_reply('MSGFMT EMALFORMED: key is not a hash')
+  end
+  local vals = redis.call('HMGET', mkey, 'DirtyBit', 'ReadAttempts')
+  if vals[1] == false or vals[2] == false then
+    return redis.error_reply('MSGFMT EMALFORMED: missing lease field')
+  end
+  if vals[1] ~= '1' then
+    return redis.error_reply('MSGFMT ENOTLEASED: message not in-flight')
+  end
+  if tonumber(vals[2]) ~= token then
+    return redis.error_reply('MSGFMT EFENCED: lease superseded')
+  end
+  redis.call('ZREM', queue, member)
+  redis.call('DEL', mkey)
+  return redis.status_reply('OK')
+end
+
+-- ---------------------------------------------------------------------------
+-- msgfmt_nack  (WRITE)
+--   KEYS[1] = message Hash. ARGV[1] = token (fencing).
+--   On a valid current lease releases it: DirtyBit=0, retaining ReadDateTime and
+--   ReadAttempts, so the message becomes available again at its original position
+--   (the queue member is never removed). Idempotent NOOP if already gone; fenced.
+-- ---------------------------------------------------------------------------
+local function msgfmt_nack(keys, args)
+  if #keys ~= 1 then
+    return redis.error_reply('MSGFMT EKEYS: exactly one key required')
+  end
+  local mkey = keys[1]
+  local token = tonumber(args[1])
+  if not is_int(token) then
+    return redis.error_reply('MSGFMT EARGS: token required')
+  end
+  if redis.call('EXISTS', mkey) == 0 then
+    return redis.status_reply('NOOP') -- already settled
+  end
+  local mt = redis.call('TYPE', mkey)
+  if mt.ok ~= 'hash' then
+    return redis.error_reply('MSGFMT EMALFORMED: key is not a hash')
+  end
+  local vals = redis.call('HMGET', mkey, 'DirtyBit', 'ReadAttempts')
+  if vals[1] == false or vals[2] == false then
+    return redis.error_reply('MSGFMT EMALFORMED: missing lease field')
+  end
+  if vals[1] ~= '1' then
+    return redis.error_reply('MSGFMT ENOTLEASED: message not in-flight')
+  end
+  if tonumber(vals[2]) ~= token then
+    return redis.error_reply('MSGFMT EFENCED: lease superseded')
+  end
+  redis.call('HSET', mkey, 'DirtyBit', '0') -- retain ReadDateTime and ReadAttempts
+  return redis.status_reply('OK')
+end
+
 redis.register_function('msgfmt_create', msgfmt_create)
 redis.register_function{
   function_name = 'msgfmt_read',
@@ -275,3 +469,6 @@ redis.register_function{
   flags         = { 'no-writes' },
 }
 redis.register_function('msgfmt_enqueue', msgfmt_enqueue)
+redis.register_function('msgfmt_dequeue', msgfmt_dequeue)
+redis.register_function('msgfmt_ack', msgfmt_ack)
+redis.register_function('msgfmt_nack', msgfmt_nack)

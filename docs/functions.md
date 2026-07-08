@@ -4,9 +4,11 @@ Developer reference for every function in `src/functions/message_format.lua`.
 The library loads with `FUNCTION LOAD` under the name **`message_format`** and runs
 unmodified on Redis 7.0+, Valkey 7.2+, ElastiCache, and MemoryDB.
 
-A *message* is a single Hash with five fields. All keys are supplied via `KEYS[]`
-(never computed); field/value pairs are supplied as a flat `name value name value ...`
-`ARGV` list (any subset — omitted fields take defaults).
+A *message* is a single Hash with five fields. Keys are supplied via `KEYS[]`; the one
+sanctioned exception is `msgfmt_dequeue`, which appends the runtime message `id` to a
+caller-supplied, co-located key prefix (`KEYS[2] .. id`) to reach a message it selects at
+runtime (constitution Principle IV, amended v2.0.0). Field/value pairs are supplied as a flat
+`name value name value ...` `ARGV` list (any subset — omitted fields take defaults).
 
 **Fields** (logical type / default / stored encoding):
 
@@ -27,7 +29,8 @@ Two layers produce error text, and the prefix is applied in exactly one place:
 - **Registered (public) functions** return failures via
   `redis.error_reply("MSGFMT <CODE>: <detail>")` and successes via
   `redis.status_reply(...)`. Codes raised *directly* inside a public function
-  (`EKEYS`, `EID`, `ESEQ`, `EEXISTS`, `EMALFORMED`, `EQDUP`) are written with the full
+  (`EKEYS`, `EID`, `ESEQ`, `EEXISTS`, `EMALFORMED`, `EQDUP`, and the dequeue/settle codes
+  `ENOW`, `ETMO`, `ESCAN`, `ETAG`, `ENOTLEASED`, `EFENCED`) are written with the full
   `MSGFMT ` prefix inline.
 - **Local helper functions** never call `redis.error_reply`. On failure they return
   `(nil, "<CODE>: <detail>")` — a **bare** string with no `MSGFMT ` prefix. The calling
@@ -41,6 +44,37 @@ So an `EFIELD` seen by a client (`MSGFMT EFIELD: Color`) originated as the bare
 ---
 
 ## Public functions (FCALL-able)
+
+### `msgfmt_ack` — acknowledge (delete) a processed message
+
+- **Purpose**: on successful processing, remove a leased message entirely — its queue member
+  and its stored Hash — in one atomic call.
+- **Write / callability**: **WRITE** (registered with no flags). Call via `FCALL`; not
+  callable via `FCALL_RO`.
+- **Inputs**: `KEYS[1]` = priority-queue **Sorted Set**; `KEYS[2]` = message **Hash**
+  (`<prefix><id>`, known from the acquire handle). `ARGV[1]` = `member` (the full queue member
+  from the handle, for `ZREM`); `ARGV[2]` = `token` (the fencing token — the `ReadAttempts`
+  value returned by `msgfmt_dequeue`).
+- **Behaviour** (fail-before-write): if `KEYS[2]` is absent → idempotent `NOOP`; if it is not a
+  hash or is missing lease fields → `EMALFORMED`; if `DirtyBit ≠ 1` → `ENOTLEASED`; if
+  `ReadAttempts ≠ token` → `EFENCED`; otherwise `ZREM KEYS[1] member` then `DEL KEYS[2]`.
+- **Returns**: `redis.status_reply("OK")`, or `redis.status_reply("NOOP")` when already settled.
+- **Commands used**: `EXISTS`, `TYPE`, `HMGET`, `ZREM`, `DEL`.
+- **Errors**:
+
+  | Reply | Trigger |
+  |-------|---------|
+  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `MSGFMT EARGS: member and token required` | empty `member` or non-integer `token` |
+  | `MSGFMT EMALFORMED: key is not a hash` | `KEYS[2]` exists, type ≠ `hash` |
+  | `MSGFMT EMALFORMED: missing lease field` | `DirtyBit`/`ReadAttempts` absent |
+  | `MSGFMT ENOTLEASED: message not in-flight` | `DirtyBit = 0` |
+  | `MSGFMT EFENCED: lease superseded` | `ReadAttempts ≠ token` |
+
+```
+FCALL msgfmt_ack 2 pq:{q1} pq:{q1}:m:2 00000000000000000002:2 1  -> OK
+FCALL msgfmt_ack 2 pq:{q1} pq:{q1}:m:2 00000000000000000002:2 1  -> NOOP   (idempotent retry)
+```
 
 ### `msgfmt_create` — create & store a message
 
@@ -68,6 +102,56 @@ FCALL msgfmt_create 1 pq:{m1}                          -> OK   (all defaults)
 FCALL msgfmt_create 1 pq:{m1} Payload "hello" Priority 5 -> OK
 FCALL msgfmt_create 1 pq:{m1} ReadAttempts -1          -> MSGFMT EINVAL: ReadAttempts
 FCALL msgfmt_create 1 pq:{m1} Color red               -> MSGFMT EFIELD: Color
+```
+
+### `msgfmt_dequeue` — acquire (lease) the front available message
+
+- **Purpose**: select the highest-priority message that is not currently being processed,
+  mark it in-flight, and return it for a consumer to work on.
+- **Write / callability**: **WRITE** (registered with no flags). Call via `FCALL`.
+- **Inputs**:
+  - `KEYS[1]` = priority-queue **Sorted Set** (e.g. `pq:{q1}`).
+  - `KEYS[2]` = message-key **prefix** (e.g. `pq:{q1}:m:`) — MUST carry the same hash tag as
+    `KEYS[1]`. The message Hash for a given `id` is `KEYS[2] .. id`.
+  - `ARGV[1]` = `now` — non-negative integer epoch ms.
+  - `ARGV[2]` = `timeout` — positive integer, the visibility timeout in ms.
+  - `ARGV[3]` = `max_scan` *(optional)* — non-negative integer; `0`/absent = unbounded.
+- **Behaviour** (fail-before-write): validate keys/args and the shared hash tag; if `KEYS[1]`
+  is absent return null, if present but not a `zset` → `EMALFORMED`. Walk the front ascending
+  (`ZRANGE`, lowest score first, ties by member = FIFO). For each member derive `id` and read
+  `mkey = KEYS[2] .. id`: a **dangling** member (Hash absent) is `ZREM`'d and skipped; a
+  malformed candidate → `EMALFORMED`. A message is **available** when `DirtyBit=0`, or
+  `DirtyBit=1` with `now − ReadDateTime ≥ timeout` (an expired lease it reclaims). On the first
+  available message: `HINCRBY ReadAttempts 1`, `HSET DirtyBit 1 ReadDateTime now`, and return.
+- **Score / lease**: the returned `ReadAttempts` is the **fencing token** for the settle call.
+- **Returns**: on a hit, a flat array (like `msgfmt_read`):
+
+```
+["id", <id>, "member", <member>, "ReadAttempts", <int token>,
+ "ReadDateTime", <int now>, "Priority", <int>, "Payload", <bytes>]
+```
+
+  When nothing is available (empty or all in-flight, within `max_scan`) it returns a **null**
+  reply — distinct from a hit whose `Payload` is an empty string.
+- **Commands used**: `EXISTS`, `TYPE`, `ZRANGE`, `HMGET`, `HINCRBY`, `HSET`, `ZREM`.
+- **Errors**:
+
+  | Reply | Trigger |
+  |-------|---------|
+  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` missing / non-integer / `<0` / `>2^53` |
+  | `MSGFMT ETMO: timeout must be a positive integer` | `ARGV[2]` missing / non-integer / `<1` / `>2^53` |
+  | `MSGFMT ESCAN: max_scan must be a non-negative integer` | `ARGV[3]` present but invalid |
+  | `MSGFMT ETAG: queue and message-key prefix must share one hash tag` | tags differ / either lacks a tag |
+  | `MSGFMT EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
+  | `MSGFMT EMALFORMED: message <mkey> is not a hash` | an inspected candidate is not a hash |
+  | `MSGFMT EMALFORMED: message <mkey> missing lease field` | a candidate lacks `DirtyBit`/`ReadDateTime`/`ReadAttempts` |
+
+```
+FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000
+  -> ["id","2","member","00000000000000000002:2","ReadAttempts",1,
+      "ReadDateTime",1000,"Priority",5,"Payload","high"]
+FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000   (empty/all-in-flight) -> (nil)
 ```
 
 ### `msgfmt_enqueue` — create a message and index it onto a priority queue
@@ -116,6 +200,35 @@ FCALL msgfmt_enqueue 2 pq:{q1} pq:{q1}:m:42 42 1 Payload "order-42" Priority 5
 re-run same call        -> MSGFMT EEXISTS: message location occupied
 ... pq:{q1}:m:9 9 -1     -> MSGFMT ESEQ: sequence must be a non-negative integer
 ... pq:{q1}:m:9 9 2 Priority foo -> MSGFMT EINVAL: Priority   (nothing written)
+```
+
+### `msgfmt_nack` — release a lease for redelivery
+
+- **Purpose**: on failed processing, release a leased message so it becomes available again at
+  its original position, preserving the record that it was read.
+- **Write / callability**: **WRITE** (registered with no flags). Call via `FCALL`.
+- **Inputs**: `KEYS[1]` = message **Hash** (`<prefix><id>`). `ARGV[1]` = `token` (the fencing
+  token). The queue member is **not** touched (it was never removed), so no queue key is needed.
+- **Behaviour** (fail-before-write): if `KEYS[1]` is absent → idempotent `NOOP`; if not a hash /
+  missing lease fields → `EMALFORMED`; if `DirtyBit ≠ 1` → `ENOTLEASED`; if `ReadAttempts ≠
+  token` → `EFENCED`; otherwise `HSET KEYS[1] DirtyBit 0` (retaining `ReadDateTime` and
+  `ReadAttempts`).
+- **Returns**: `redis.status_reply("OK")`, or `redis.status_reply("NOOP")` when already settled.
+- **Commands used**: `EXISTS`, `TYPE`, `HMGET`, `HSET`.
+- **Errors**:
+
+  | Reply | Trigger |
+  |-------|---------|
+  | `MSGFMT EKEYS: exactly one key required` | `#KEYS ≠ 1` |
+  | `MSGFMT EARGS: token required` | non-integer `token` |
+  | `MSGFMT EMALFORMED: key is not a hash` | `KEYS[1]` exists, type ≠ `hash` |
+  | `MSGFMT EMALFORMED: missing lease field` | `DirtyBit`/`ReadAttempts` absent |
+  | `MSGFMT ENOTLEASED: message not in-flight` | `DirtyBit = 0` |
+  | `MSGFMT EFENCED: lease superseded` | `ReadAttempts ≠ token` |
+
+```
+FCALL msgfmt_nack 1 pq:{q1}:m:2 1   -> OK    (DirtyBit->0; available again; ReadAttempts kept)
+FCALL msgfmt_nack 1 pq:{q1}:m:2 1   -> ENOTLEASED   (already released)
 ```
 
 ### `msgfmt_read` — read a message into a typed shape

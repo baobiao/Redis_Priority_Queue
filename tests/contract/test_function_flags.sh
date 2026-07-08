@@ -23,6 +23,14 @@ for e in $ENGINES; do
   out=$(fcall_ro "$e" msgfmt_enqueue 2 "pq:{flag}" "pq:{flag}:m:1" 1 1 2>&1 || true)
   expect_contains "enqueue rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
 
+  # msgfmt_dequeue / msgfmt_ack / msgfmt_nack are writes and must be rejected under FCALL_RO (Feature 003).
+  out=$(fcall_ro "$e" msgfmt_dequeue 2 "pq:{flag}" "pq:{flag}:m:" 1000 30000 2>&1 || true)
+  expect_contains "dequeue rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
+  out=$(fcall_ro "$e" msgfmt_ack 2 "pq:{flag}" "pq:{flag}:m:1" "00000000000000000001:1" 1 2>&1 || true)
+  expect_contains "ack rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
+  out=$(fcall_ro "$e" msgfmt_nack 1 "pq:{flag}:m:1" 1 2>&1 || true)
+  expect_contains "nack rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
+
   # Reader works under the read-only command.
   engine_cli "$e" DEL "q:{flag}" >/dev/null
   fcall "$e" msgfmt_create 1 "q:{flag}" >/dev/null

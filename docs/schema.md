@@ -3,11 +3,15 @@
 Developer reference for the on-server data model of this priority-queue library.
 Audience: Redis/Valkey developers integrating with the `message_format` library.
 
-The library uses exactly **two native data types** and never invents keys:
+The library uses exactly **two native data types**:
 
-- a **Hash** per message (`msgfmt_create`, `msgfmt_read`, `msgfmt_enqueue`; `msgfmt_validate`
-  checks field values only and touches no key);
-- a **Sorted Set (ZSET)** per priority queue (`msgfmt_enqueue`).
+- a **Hash** per message (`msgfmt_create`, `msgfmt_read`, `msgfmt_enqueue`, `msgfmt_dequeue`,
+  `msgfmt_ack`, `msgfmt_nack`; `msgfmt_validate` checks field values only and touches no key);
+- a **Sorted Set (ZSET)** per priority queue (`msgfmt_enqueue`, `msgfmt_dequeue`, `msgfmt_ack`).
+
+Every key is caller-supplied via `KEYS[]`, with one sanctioned exception: `msgfmt_dequeue`
+appends the runtime message `id` to a caller-supplied, co-located key prefix (`KEYS[2] .. id`)
+to reach the message it selects at runtime (constitution Principle IV, amended v2.0.0).
 
 Source of truth: `src/functions/message_format.lua`. All values below are what the
 Lua actually encodes/validates — not aspirational.
@@ -103,10 +107,43 @@ silently corrupting order. Instead:
 
 ---
 
-## 3. Keys & Cluster Co-location
+## 3. The Lease — in-flight state, visibility timeout, and fencing
 
-Every key is **caller-supplied via `KEYS[]`**; the library never computes, derives, or
-hardcodes a key name. `msgfmt_enqueue` takes two keys:
+`msgfmt_dequeue` does not remove a message from the queue; it **leases** it. The lease is
+expressed entirely in three existing Hash fields — no new keys or fields:
+
+| Field | Role while leased |
+|-------|-------------------|
+| `DirtyBit` | `1` = in-flight (leased); `0` = available. Acquire sets `1`; `msgfmt_nack` resets to `0`; `msgfmt_ack` deletes the message. |
+| `ReadDateTime` | The lease start (the caller's `now`, epoch ms). Drives timeout expiry. |
+| `ReadAttempts` | Incremented on every grant (initial acquire and each reclaim). Its value at grant is the **fencing token**. |
+
+**Availability**: `msgfmt_dequeue` returns the front message that is either `DirtyBit=0`, or
+`DirtyBit=1` with an **expired** lease (`now − ReadDateTime ≥ timeout`, the caller-supplied
+visibility timeout). A message stays in the Sorted Set from enqueue until `msgfmt_ack`; while
+leased it remains a member but is skipped by other acquires until its lease expires.
+
+**Visibility timeout**: if a consumer crashes after acquiring but before settling, the lease is
+reclaimed by the next acquire once `timeout` has elapsed since `ReadDateTime`. Both `now` and
+`timeout` are caller-supplied (deterministic; no server clock).
+
+**Fencing token**: because every grant increments `ReadAttempts`, its value uniquely identifies
+a lease generation. `msgfmt_ack` / `msgfmt_nack` proceed only when the message is in-flight
+(`DirtyBit=1`) **and** its current `ReadAttempts` equals the token the caller holds; a stale
+token (from a lease reclaimed by another consumer) is rejected with `EFENCED`, so a revived
+crashed consumer cannot settle a message someone else now holds. Settling an already-removed
+message is an idempotent `NOOP`; settling a non-leased message is `ENOTLEASED`.
+
+**Lifecycle**: `AVAILABLE → (dequeue) LEASED → (ack) REMOVED`, or `LEASED → (nack) AVAILABLE`,
+with `LEASED → (timeout) reclaimable`. `ReadAttempts` records how many times a message has been
+delivered — the signal a future dead-letter feature would use (capping is out of scope here;
+redelivery is currently unbounded).
+
+## 4. Keys & Cluster Co-location
+
+Every key is **caller-supplied via `KEYS[]`**. The library never hardcodes a key name; the one
+sanctioned construction is `msgfmt_dequeue` appending the runtime `id` to a caller-supplied,
+co-located prefix (see below). `msgfmt_enqueue` takes two keys:
 
 - `KEYS[1]` = the priority-queue **Sorted Set**;
 - `KEYS[2]` = the message **Hash**.
@@ -120,14 +157,22 @@ KEYS[1] = pq:{q1}          # the queue Sorted Set
 KEYS[2] = pq:{q1}:m:42     # the message Hash  (same tag "q1" -> same slot)
 ```
 
+`msgfmt_dequeue` takes `KEYS[1]` = the queue Sorted Set and `KEYS[2]` = the message-key
+**prefix** (e.g. `pq:{q1}:m:`), and reaches each candidate message at `KEYS[2] .. id`. It first
+checks that the prefix carries the queue's hash tag (else `MSGFMT ETAG`), so every constructed
+key — e.g. `pq:{q1}:m:42` — lands in the queue's slot. `msgfmt_ack` receives the queue and the
+specific message Hash directly in `KEYS[]`; `msgfmt_nack` receives only the message Hash.
+
 Amazon **ElastiCache** and **MemoryDB** always run in cluster mode and **reject cross-slot
 multi-key access with a `CROSSSLOT` error**. Callers that omit or mismatch the hash tag
 (e.g. `pq:{q1}` with `pq:{q2}:m:42`) will fail there. Use one shared tag per logical queue and
-put every key for that queue (the Sorted Set and all its message Hashes) inside it.
+put every key for that queue (the Sorted Set, the message-key prefix, and all its message
+Hashes) inside it. During slot **resharding**, a call touching the runtime-constructed key may
+transiently return `TRYAGAIN`/`ASK`; clients should retry.
 
 ---
 
-## 4. Portability
+## 5. Portability
 
 A **single, identical Lua source** (`src/functions/message_format.lua`) is designed to run
 unmodified on:
@@ -138,7 +183,9 @@ unmodified on:
 - **Amazon MemoryDB**
 
 To stay portable the library uses only **commonly-supported commands and options** across all
-four targets. The data model above relies on just: `HSET`, `HMGET`, `EXISTS`, `TYPE`, `ZSCORE`,
-and `ZADD` — no engine-specific commands, options, admin/privileged commands, or non-deterministic
-sources (score and member derive solely from `ARGV`, never from server time, counters, or random).
-This keeps behaviour identical whether running standalone or clustered.
+four targets. The full data model relies on just: `HSET`, `HMGET`, `HINCRBY`, `EXISTS`, `TYPE`,
+`DEL`, `ZADD`, `ZSCORE`, `ZRANGE`, and `ZREM` — no engine-specific commands, options, or
+admin/privileged commands, and no non-deterministic sources: score, member, the lease times
+(`now`, `timeout`), and the fencing token all derive from `ARGV` or existing field values,
+never from server time, counters, or random. This keeps behaviour identical whether running
+standalone or clustered.

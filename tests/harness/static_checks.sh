@@ -10,7 +10,13 @@
 #                    Redis 7.0+, Valkey 7.2+, ElastiCache, MemoryDB
 #   - Principle VII: no non-deterministic sources (TIME, math.random) in bodies
 #
-# Also covers the enqueue function added by Feature 002 (specs/002-enqueue/).
+# Also covers the enqueue function (Feature 002, specs/002-enqueue/) and the
+# dequeue/ack/nack functions (Feature 003, specs/003-dequeue/). Note: Principle IV
+# was amended in constitution v2.0.0 to permit ONE narrow construction — appending a
+# runtime suffix to a declared, hash-tagged KEYS[] prefix (msgfmt_dequeue's
+# `KEYS[2] .. id`). Such a key is held in a Lua variable, so the literal-key scan
+# below (which only flags a key argument beginning with a quote) does not fire on it;
+# hardcoded literal keys are still rejected.
 # Exits non-zero on any violation.
 set -euo pipefail
 
@@ -46,12 +52,13 @@ fi
 
 # IV. Keys must come from KEYS[]; flag obvious computed/hardcoded keys passed to
 #     keyed commands as a string literal (e.g. redis.call('HSET', 'literalkey', ...)).
-if printf '%s\n' "$code" | grep -Eiq "redis\.call\([^)]*['\"](HSET|HGET|HMGET|HGETALL|HDEL|EXISTS|TYPE|DEL|SET|GET|ZADD|ZSCORE|ZCARD|ZRANGE)['\"][[:space:]]*,[[:space:]]*['\"]"; then
+if printf '%s\n' "$code" | grep -Eiq "redis\.call\([^)]*['\"](HSET|HGET|HMGET|HGETALL|HDEL|HINCRBY|EXISTS|TYPE|DEL|SET|GET|ZADD|ZREM|ZSCORE|ZCARD|ZRANGE)['\"][[:space:]]*,[[:space:]]*['\"]"; then
   note "keyed command appears to use a string-literal key (keys must come from KEYS[])"
 fi
 
 # III. Whitelist of commands this feature is allowed to use.
-allowed='HSET|HGET|HMGET|HGETALL|HDEL|EXISTS|TYPE|DEL|ZADD|ZSCORE|ZCARD|ZRANGE'
+# ZREM/HINCRBY added by Feature 003 (specs/003-dequeue/): dequeue/ack/nack.
+allowed='HSET|HGET|HMGET|HGETALL|HDEL|HINCRBY|EXISTS|TYPE|DEL|ZADD|ZREM|ZSCORE|ZCARD|ZRANGE'
 while IFS= read -r cmd; do
   [ -z "$cmd" ] && continue
   if ! printf '%s' "$cmd" | grep -Eiq "^(${allowed})$"; then

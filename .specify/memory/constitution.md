@@ -1,7 +1,36 @@
 <!--
 SYNC IMPACT REPORT
 ==================
-Version change: 1.1.0 → 1.2.0
+Version change: 1.2.0 → 2.0.0
+Bump rationale: MAJOR — redefinition of Principle IV (Cluster-Safe Key Access). The
+  principle previously forbade ALL internal key computation ("Functions MUST NOT compute,
+  derive, or hardcode key names internally"). It now permits ONE narrow, sanctioned
+  construction: appending a runtime-derived suffix to a key/prefix that was passed in via
+  KEYS[] and carries the shared hash tag, and only when the exact key cannot be known by the
+  caller in advance (e.g. a queue dequeue reaching the message it selected at runtime).
+  Hardcoded keys and all other derivations remain forbidden; cluster-safety (same-slot) is
+  preserved because the extended prefix carries the hash tag. Enables Feature 003 (Dequeue),
+  whose acquire step must address a message discovered at runtime while remaining a single
+  atomic FCALL (Principle VI).
+
+Modified in 2.0.0:
+  - Principle IV (Cluster-Safe Key Access): redefined to allow the sanctioned
+    append-suffix-to-declared-tagged-prefix construction; Check and Rationale updated.
+  - Development Workflow & Quality Gates: static-rejection bullet reworded from
+    "computed/hardcoded key names" to "hardcoded key names and unsanctioned key construction".
+
+Templates requiring updates:
+  ✅ .specify/templates/plan-template.md      — no change (Constitution Check gate defers dynamically)
+  ✅ .specify/templates/spec-template.md      — no change (domain-agnostic)
+  ✅ .specify/templates/tasks-template.md     — no change (domain-agnostic)
+  ✅ .specify/templates/checklist-template.md — no change (generic)
+
+Follow-up: tests/harness/static_checks.sh MUST be updated in the implementing feature to
+  match the redefined Principle IV (permit the sanctioned construction; still reject
+  hardcoded literal keys) and to whitelist the feature's new commands (ZREM, HINCRBY).
+
+------------------------------------------------------------
+Prior entry — Version change: 1.1.0 → 1.2.0
 Bump rationale: MINOR — added Principle X (Documentation Currency): the developer
   documentation (README.md, docs/schema.md, docs/functions.md) MUST be kept current with
   every feature change. New principle; none removed or redefined.
@@ -9,12 +38,6 @@ Bump rationale: MINOR — added Principle X (Documentation Currency): the develo
 Modified in 1.2.0:
   - Added Principle X (Documentation Currency).
   - Development Workflow & Quality Gates: added a documentation-currency check at PR review.
-
-Templates requiring updates:
-  ✅ .specify/templates/plan-template.md      — no change (Constitution Check gate defers dynamically)
-  ✅ .specify/templates/spec-template.md      — no change (domain-agnostic)
-  ✅ .specify/templates/tasks-template.md     — no change (domain-agnostic)
-  ✅ .specify/templates/checklist-template.md — no change (generic)
 
 ------------------------------------------------------------
 Prior entry — Version change: 1.0.0 → 1.1.0
@@ -118,16 +141,33 @@ all four targets.
 
 ### IV. Cluster-Safe Key Access
 
-Every key a function touches MUST be passed in via `KEYS[]`. Functions MUST NOT compute,
-derive, or hardcode key names internally. All keys accessed in a single call MUST hash to
-the same slot, and related keys MUST be co-located with a hash tag
-(e.g. `user:{42}:profile`, `user:{42}:sessions`).
+Every key a function touches MUST resolve from a key passed in via `KEYS[]` — either used
+directly, or extended by the one sanctioned construction below. Functions MUST NOT hardcode
+key names, and MUST NOT derive a key from arbitrary input or from the contents of another
+key. All keys accessed in a single call MUST hash to the same slot, and related keys MUST be
+co-located with a hash tag (e.g. `user:{42}:profile`, `user:{42}:sessions`).
 
-**Check**: CI MUST statically reject computed/hardcoded key names inside function bodies
-and MUST exercise cluster mode to surface `CROSSSLOT` errors.
+**Sanctioned key construction**: A function MAY form a key by appending a runtime-derived
+suffix to a key or key-prefix supplied in `KEYS[]` — e.g. `KEYS[2] .. id`, where `KEYS[2]`
+is a caller-declared, hash-tagged prefix — **only when** the exact target key cannot be known
+by the caller in advance (for example, reaching an element discovered by scanning a
+collection, as when a queue *dequeue* must address the message it selected at runtime). The
+extended `KEYS[]` entry MUST carry the shared hash tag, so every constructed key lands in the
+same slot as the declared keys. Any construction that could change the hash tag, or that
+builds a key from data not co-located under a declared tag, remains forbidden.
 
-**Rationale**: ElastiCache and MemoryDB always run in cluster mode and reject undeclared
-keys and cross-slot access (`CROSSSLOT`).
+**Check**: CI MUST statically reject hardcoded key names and any key construction other than
+the sanctioned "append a runtime suffix to a declared, hash-tagged `KEYS[]` prefix" form, and
+MUST exercise cluster mode to surface `CROSSSLOT` errors. Review MUST confirm each sanctioned
+construction extends a declared, hash-tagged key and that the exact key was genuinely not
+knowable by the caller.
+
+**Rationale**: ElastiCache and MemoryDB always run in cluster mode and reject cross-slot
+access (`CROSSSLOT`); the slot is fixed by the hash tag, so appending a suffix to a declared,
+co-located prefix stays in-slot. Some operations (e.g. dequeue) must address a key discovered
+only at runtime — forbidding this outright would make them impossible to express as a single
+atomic server-side call (Principle VI). The exception is kept deliberately narrow (extend a
+declared, tagged prefix, nothing else) so cluster-safety is preserved.
 
 ### V. No Privileged or Admin Commands
 
@@ -241,8 +281,8 @@ maintaining the library; updating it in the same change keeps it trustworthy.
 - CI MUST:
   - Load and run the function library on Redis 7.0+ and Valkey 7.2+.
   - Exercise cluster mode.
-  - Statically reject restricted commands (Principle V), computed/hardcoded key names
-    (Principle IV), and cross-slot access.
+  - Statically reject restricted commands (Principle V), hardcoded key names and
+    unsanctioned key construction (Principle IV), and cross-slot access.
   - Verify `FUNCTION LOAD` succeeds on each target engine version.
 
 ## Governance
@@ -258,4 +298,4 @@ maintaining the library; updating it in the same change keeps it trustworthy.
 - Compliance is reviewed at the `/speckit.plan` and `/speckit.implement` gates;
   violations block progress until resolved or the constitution is formally amended.
 
-**Version**: 1.2.0 | **Ratified**: 2026-05-30 | **Last Amended**: 2026-07-07
+**Version**: 2.0.0 | **Ratified**: 2026-05-30 | **Last Amended**: 2026-07-08
