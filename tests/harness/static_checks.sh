@@ -8,7 +8,9 @@
 #   - Principle II: no third-party module usage (no `require`)
 #   - Principle III: only commands on the common-supported list for
 #                    Redis 7.0+, Valkey 7.2+, ElastiCache, MemoryDB
+#   - Principle VII: no non-deterministic sources (TIME, math.random) in bodies
 #
+# Also covers the enqueue function added by Feature 002 (specs/002-enqueue/).
 # Exits non-zero on any violation.
 set -euo pipefail
 
@@ -34,14 +36,22 @@ if printf '%s\n' "$code" | grep -Eq '(^|[^.[:alnum:]])require[[:space:]]*\('; th
   note "use of require() (third-party module) is forbidden"
 fi
 
+# VII. Determinism: no wall-clock or randomness sources in function bodies (FR-015).
+if printf '%s\n' "$code" | grep -Eiq "redis\.call[^)]*['\"]TIME['\"]"; then
+  note "non-deterministic TIME command referenced in a redis.call"
+fi
+if printf '%s\n' "$code" | grep -Eq '(^|[^.[:alnum:]])math\.random[[:space:]]*\('; then
+  note "non-deterministic math.random() is forbidden"
+fi
+
 # IV. Keys must come from KEYS[]; flag obvious computed/hardcoded keys passed to
 #     keyed commands as a string literal (e.g. redis.call('HSET', 'literalkey', ...)).
-if printf '%s\n' "$code" | grep -Eiq "redis\.call\([^)]*['\"](HSET|HGET|HMGET|HGETALL|HDEL|EXISTS|TYPE|DEL|SET|GET)['\"][[:space:]]*,[[:space:]]*['\"]"; then
+if printf '%s\n' "$code" | grep -Eiq "redis\.call\([^)]*['\"](HSET|HGET|HMGET|HGETALL|HDEL|EXISTS|TYPE|DEL|SET|GET|ZADD|ZSCORE|ZCARD|ZRANGE)['\"][[:space:]]*,[[:space:]]*['\"]"; then
   note "keyed command appears to use a string-literal key (keys must come from KEYS[])"
 fi
 
 # III. Whitelist of commands this feature is allowed to use.
-allowed='HSET|HGET|HMGET|HGETALL|HDEL|EXISTS|TYPE|DEL'
+allowed='HSET|HGET|HMGET|HGETALL|HDEL|EXISTS|TYPE|DEL|ZADD|ZSCORE|ZCARD|ZRANGE'
 while IFS= read -r cmd; do
   [ -z "$cmd" ] && continue
   if ! printf '%s' "$cmd" | grep -Eiq "^(${allowed})$"; then
