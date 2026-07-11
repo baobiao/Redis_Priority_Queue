@@ -8,13 +8,21 @@ priority queue entirely inside the engine.
 - Each **queue** is a **Sorted Set** ordered by `Priority` — **lower score = higher
   priority = front of the queue**. FIFO among equal priorities is preserved by the
   member (a zero-padded caller-supplied `sequence`, then the caller-supplied `id`).
+- A **consumer** leases the highest-priority available message with `msgfmt_dequeue`
+  (marking it in-flight via `DirtyBit`, stamping `ReadDateTime`, incrementing
+  `ReadAttempts`), then settles it with `msgfmt_ack` (delete on success) or `msgfmt_nack`
+  (release for redelivery on failure). An unsettled lease is reclaimed after a
+  caller-supplied **visibility timeout**, and a **fencing token** stops a stale consumer
+  from settling a message that has since been reacquired.
 - The **same Lua source runs unmodified** on **Redis 7.0+**, **Valkey 7.2+**,
   **Amazon ElastiCache**, and **Amazon MemoryDB**.
 - It is deployed with `FUNCTION LOAD` and invoked with `FCALL` (writes) / `FCALL_RO`
-  (reads). Every key is caller-supplied; the library never invents keys.
+  (reads). Every key is caller-supplied via `KEYS[]`; the one sanctioned exception is
+  `msgfmt_dequeue`, which appends the runtime message `id` to a caller-supplied,
+  co-located key **prefix** (constitution Principle IV, amended in v2.0.0).
 
-The current library exposes four functions: `msgfmt_create`, `msgfmt_enqueue`,
-`msgfmt_read`, and `msgfmt_validate`.
+The current library exposes seven functions: `msgfmt_ack`, `msgfmt_create`,
+`msgfmt_dequeue`, `msgfmt_enqueue`, `msgfmt_nack`, `msgfmt_read`, and `msgfmt_validate`.
 
 See [`docs/schema.md`](docs/schema.md) for the message schema and the native types, and
 [`docs/functions.md`](docs/functions.md) for every function's `KEYS` / `ARGV` / return
@@ -43,7 +51,7 @@ Load (or replace) the library, then confirm it registered:
 
 ```bash
 redis-cli FUNCTION LOAD REPLACE "$(cat src/functions/message_format.lua)"
-redis-cli FUNCTION LIST   # msgfmt_create, msgfmt_read, msgfmt_validate, msgfmt_enqueue
+redis-cli FUNCTION LIST   # msgfmt_create/read/validate/enqueue/dequeue/ack/nack
 ```
 
 ### Enqueue onto a priority queue
@@ -77,6 +85,37 @@ redis-cli FCALL_RO msgfmt_read 1 pq:{q1}:m:2
 # -> ["ReadAttempts",0,"DirtyBit",0,"ReadDateTime",0,"Priority",5,"Payload","high"]
 ```
 
+### Dequeue, process, and settle
+
+`msgfmt_dequeue` `KEYS`: `1` = queue Sorted Set, `2` = message-key **prefix** (same hash tag
+as the queue). `ARGV`: `now` (epoch ms), `timeout` (visibility ms), optional `max_scan`. It
+returns a handle (or a null reply when nothing is available).
+
+```bash
+# Lease the highest-priority available message (now=1000ms, visibility=30000ms).
+redis-cli FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000
+# -> ["id","2","member","00000000000000000002:2","ReadAttempts",1,
+#     "ReadDateTime",1000,"Priority",5,"Payload","high"]
+```
+
+The message is now in-flight (`DirtyBit=1`); other consumers skip it until it is settled or
+its lease expires. `ReadAttempts` (here `1`) is the **fencing token** — pass it back to settle.
+
+```bash
+# On success: delete it (KEYS: queue, message hash; ARGV: member, token).
+redis-cli FCALL msgfmt_ack 2 pq:{q1} pq:{q1}:m:2 00000000000000000002:2 1
+# -> OK    (a retry returns NOOP)
+
+# On failure: release it for redelivery (KEYS: message hash; ARGV: token).
+redis-cli FCALL msgfmt_nack 1 pq:{q1}:m:2 1
+# -> OK    (DirtyBit back to 0; ReadDateTime/ReadAttempts retained)
+```
+
+If a consumer crashes without settling, the next `msgfmt_dequeue` whose `now` is at least
+`timeout` past the lease's `ReadDateTime` reclaims the message (incrementing `ReadAttempts`
+and issuing a new token); the crashed consumer's old token is then rejected with
+`MSGFMT EFENCED`.
+
 ### Create a standalone message (no queue index)
 
 ```bash
@@ -88,9 +127,9 @@ redis-cli FCALL msgfmt_create 1 q:{m2} Payload "order-42" Priority 5
 ```
 
 `msgfmt_read` and `msgfmt_validate` are `no-writes` and callable with `FCALL_RO`;
-`msgfmt_create` and `msgfmt_enqueue` are writes and are rejected under `FCALL_RO`. All
-failures return a structured `MSGFMT E...` error, and enqueue is fail-before-write —
-nothing is written to either structure on error.
+`msgfmt_create`, `msgfmt_enqueue`, `msgfmt_dequeue`, `msgfmt_ack`, and `msgfmt_nack` are
+writes and are rejected under `FCALL_RO`. All failures return a structured `MSGFMT E...`
+error, and every write is fail-before-write — nothing is written on any error.
 
 ## Run the tests locally
 
@@ -128,11 +167,11 @@ bash tests/harness/docker_engines.sh down
 ├── src/
 │   └── functions/
 │       └── message_format.lua    # the Redis/Valkey Functions library (Lua)
-├── specs/                        # feature specs (001-message-format, 002-enqueue)
+├── specs/                        # feature specs (001-message-format, 002-enqueue, 003-dequeue)
 └── tests/
     ├── run_all.sh                # convenience runner (all suites + static gate)
     ├── harness/                  # docker_engines.sh, load_and_call.sh, static_checks.sh
     ├── contract/                 # KEYS/ARGV/return-shape/flags assertions
-    ├── integration/              # end-to-end behaviour (roundtrip, conflict)
+    ├── integration/              # end-to-end behaviour (enqueue roundtrip/conflict; dequeue roundtrip/concurrency/visibility)
     └── unit/                     # validation edge cases
 ```
