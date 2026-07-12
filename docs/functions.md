@@ -20,14 +20,19 @@ runtime (constitution Principle IV, amended v2.0.0). Field/value pairs are suppl
 | `Priority` | integer (lower = higher priority) | `1000` | integer, `-2^53 … 2^53` | decimal string |
 | `Payload` | string | `""` | none (any value accepted) | `tostring(value)` |
 | `VisibleAt` | integer ≥ 0 (epoch ms) | `0` | integer, `0 … 2^53` | decimal string |
+| `DeadLetteredAt` | integer ≥ 0 (epoch ms) | `0` | integer, `0 … 2^53` | decimal string |
 
 `2^53` is `MAX_SAFE_INT = 9007199254740992`, the exact-integer ceiling for Lua doubles.
 
 `VisibleAt` (Feature 005) is a **not-before time**: a message is not deliverable until `now ≥
 VisibleAt` (`0` = immediately visible). It is distinct from the lease *visibility timeout* (which
-reclaims an in-flight message). It flows through the normal field path, so `msgfmt_create` and
-`msgfmt_enqueue` accept it as a field with no signature change; a **missing** `VisibleAt` (a message
-stored before Feature 005) is treated as `0`.
+reclaims an in-flight message).
+
+`DeadLetteredAt` (Feature 006) records **when** a message was dead-lettered (`0` = not dead-lettered);
+`msgfmt_dequeue` stamps it on the dead-letter move and `msgfmt_reap` ages the DLQ out by it.
+
+Both flow through the normal field path, so `msgfmt_create`/`msgfmt_enqueue` accept them with no
+signature change; a **missing** `VisibleAt` (pre-005) or `DeadLetteredAt` (pre-006) is treated as `0`.
 
 ## Error convention
 
@@ -138,7 +143,8 @@ FCALL msgfmt_create 1 pq:{m1} Color red               -> MSGFMT EFIELD: Color
   **and** `now ≥ VisibleAt` (the Feature 005 not-before gate; a missing `VisibleAt` is treated as
   `0`). A not-yet-visible message is skipped (counts against `max_scan`), like an unexpired lease.
   For the first deliverable message: **in dead-letter mode, if `ReadAttempts ≥ cap`** it is moved to
-  the DLQ (`ZREM KEYS[1] member`, `ZADD KEYS[3] <Priority> member` — the Hash is untouched) and the
+  the DLQ (`ZREM KEYS[1] member`, `ZADD KEYS[3] <Priority> member`, and — Feature 006 —
+  `HSET <mkey> DeadLetteredAt now` to stamp the dead-letter time; no other field is touched) and the
   scan **continues**; otherwise it is leased — `HINCRBY ReadAttempts 1`, `HSET DirtyBit 1 ReadDateTime
   now` — and returned. (Because the cap check runs only after the visibility gate, a not-yet-visible
   over-cap message is not dead-lettered until it becomes visible.)
@@ -286,11 +292,11 @@ FCALL msgfmt_nack 1 pq:{q1}:m:2 1        -> ENOTLEASED   (already released)
   Dangling members (Hash absent) are **skipped and never removed** (read-only); a malformed Hash
   errors in single mode if it is the selected candidate, and is skipped in top-N mode.
 - **Returns**: single mode — one **record** array, or null; top-N mode — an **array of records**
-  (`0 … count`). A record is (note `VisibleAt`, Feature 005):
+  (`0 … count`). A record is (note `VisibleAt`, Feature 005; `DeadLetteredAt`, Feature 006):
 
 ```
 ["id", <id>, "member", <member>, "DirtyBit", <0|1>, "ReadAttempts", <int>,
- "ReadDateTime", <int>, "Priority", <int>, "Payload", <bytes>, "VisibleAt", <int>]
+ "ReadDateTime", <int>, "Priority", <int>, "Payload", <bytes>, "VisibleAt", <int>, "DeadLetteredAt", <int>]
 ```
 
 - **Commands used**: `EXISTS`, `TYPE`, `ZRANGE`, `HMGET` (no writes).
@@ -322,18 +328,19 @@ FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10  (inspect the DLQ)
 - **Inputs**: `KEYS[1]` = message Hash key. No `ARGV`.
 - **Behaviour**: if the key is absent, return `NOTFOUND`; if it exists but is not a Hash
   or is missing any of the **five original** fields, return `EMALFORMED`; otherwise `HMGET`
-  the fields and decode them. A **missing `VisibleAt`** (a message stored before Feature 005)
-  is tolerated and decoded as `0` (immediately visible) — it does **not** cause `EMALFORMED`.
-- **Returns**: a flat, RESP map-style array of field/value pairs with decoded values (six pairs
-  since Feature 005):
+  the fields and decode them. A **missing `VisibleAt`** (pre-005) or **`DeadLetteredAt`** (pre-006)
+  is tolerated and decoded as `0` — it does **not** cause `EMALFORMED`.
+- **Returns**: a flat, RESP map-style array of field/value pairs with decoded values (seven pairs
+  since Feature 006):
 
 ```
-["ReadAttempts", <int>,
- "DirtyBit",     <0|1>,
- "ReadDateTime", <int>,
- "Priority",     <int>,
- "Payload",      <string>,
- "VisibleAt",    <int>]
+["ReadAttempts",   <int>,
+ "DirtyBit",       <0|1>,
+ "ReadDateTime",   <int>,
+ "Priority",       <int>,
+ "Payload",        <string>,
+ "VisibleAt",      <int>,
+ "DeadLetteredAt", <int>]
 ```
 
   **Why `DirtyBit` is integer `0`/`1`, not a Lua boolean**: RESP2 has no boolean type,
@@ -350,8 +357,45 @@ FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10  (inspect the DLQ)
 
 ```
 FCALL_RO msgfmt_read 1 pq:{m1}   (after default create)
-  -> ["ReadAttempts",0,"DirtyBit",0,"ReadDateTime",0,"Priority",1000,"Payload","","VisibleAt",0]
+  -> ["ReadAttempts",0,"DirtyBit",0,"ReadDateTime",0,"Priority",1000,"Payload","","VisibleAt",0,"DeadLetteredAt",0]
 FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
+```
+
+### `msgfmt_reap` — age out old dead-lettered messages
+
+- **Purpose**: permanently remove dead-lettered messages older than a caller-supplied retention window,
+  bounded per call, so the dead-letter queue does not grow without bound.
+- **Write / callability**: **WRITE** (registered with no flags). Call via `FCALL`.
+- **Inputs**:
+  - `KEYS[1]` = dead-letter **Sorted Set**; `KEYS[2]` = message-key **prefix** (same hash tag).
+  - `ARGV[1]` = `now` — non-negative integer epoch ms.
+  - `ARGV[2]` = `retention` — non-negative integer window (ms).
+  - `ARGV[3]` = `limit` — positive integer; max DLQ front members to examine this call.
+- **Behaviour** (bounded; fail-before-write on validation): validate keys/args + shared tag; absent DLQ
+  → `{removed 0, scanned 0, truncated 0}`; non-`zset` DLQ → `EMALFORMED`. `ZRANGE` the front up to
+  `limit`; for each member (`id` derived, `mkey = KEYS[2] .. id`): a **dangling** member (Hash missing)
+  is `ZREM`'d and counted; otherwise if `DeadLetteredAt ≤ now − retention` it is removed —
+  `ZREM KEYS[1] member` **and** `DEL mkey` (retention = permanently gone) — and counted. `truncated = 1`
+  when `ZCARD > limit`.
+- **Priority-order caveat**: reap walks the DLQ front *in Priority order*, so a small `limit` may miss
+  expired low-priority entries behind unexpired high-priority ones; size `limit` to the DLQ depth (from
+  `msgfmt_stats`) or page to fully drain.
+- **Returns**: a flat map `["removed", <int>, "scanned", <int>, "truncated", <0|1>]`.
+- **Commands used**: `EXISTS`, `TYPE`, `ZRANGE`, `HGET`, `ZREM`, `DEL`, `ZCARD`.
+- **Errors**:
+
+  | Reply | Trigger |
+  |-------|---------|
+  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
+  | `MSGFMT ERET: retention must be a non-negative integer` | `ARGV[2]` invalid |
+  | `MSGFMT ELIMIT: limit must be a positive integer` | `ARGV[3]` invalid |
+  | `MSGFMT ETAG: dead-letter queue and message-key prefix must share one hash tag` | tags differ / missing |
+  | `MSGFMT EMALFORMED: dead-letter queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
+
+```
+FCALL msgfmt_reap 2 dlq:{q1} pq:{q1}:m: 140000 30000 500
+  -> ["removed",7,"scanned",500,"truncated",1]   (7 expired/dangling removed; DLQ still has >500)
 ```
 
 ### `msgfmt_redrive` — move a message from the DLQ back to its source
@@ -368,9 +412,10 @@ FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
   `ZSCORE KEYS[1] member` nil → **`NOOP`** (not in the DLQ); `ZSCORE KEYS[2] member` non-nil →
   **`EQDUP`** (already in the source); `KEYS[3]` absent / not a hash / missing `Priority` →
   `EMALFORMED`. Otherwise, in one atomic call: `ZREM KEYS[1] member`, `ZADD KEYS[2] <Priority> member`
-  (score read from the Hash, member verbatim), `HSET KEYS[3] ReadAttempts 0 DirtyBit 0 VisibleAt 0` —
-  **`ReadDateTime` is retained**; `VisibleAt` is reset to `0` so the redriven message is immediately
-  visible (Feature 005).
+  (score read from the Hash, member verbatim),
+  `HSET KEYS[3] ReadAttempts 0 DirtyBit 0 VisibleAt 0 DeadLetteredAt 0` — **`ReadDateTime` is retained**;
+  `VisibleAt` is reset so the redriven message is immediately visible (Feature 005), and `DeadLetteredAt`
+  is cleared so it is no longer considered dead-lettered (Feature 006).
 - **Returns**: `redis.status_reply("OK")` on a move; `redis.status_reply("NOOP")` when the member was
   not in the DLQ.
 - **Commands used**: `ZSCORE`, `EXISTS`, `TYPE`, `HGET`, `ZREM`, `ZADD`, `HSET`.
@@ -388,9 +433,58 @@ FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
 
 ```
 FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
-  -> OK    (member back in pq:{q1} at its Priority; hash reset RA=0/DB=0/VisibleAt=0, ReadDateTime kept)
+  -> OK    (member back in pq:{q1} at its Priority; hash reset RA=0/DB=0/VisibleAt=0/DeadLetteredAt=0, ReadDateTime kept)
 FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
   -> NOOP  (already redriven; no longer in the DLQ)
+```
+
+### `msgfmt_stats` — aggregate queue state (read-only observability)
+
+- **Purpose**: report aggregate queue state without consuming — depths, front Priority, and an optional
+  bounded breakdown by message state — beyond `msgfmt_peek`'s head view.
+- **Write / callability**: **NO-WRITES** (registered with `flags = { 'no-writes' }`). Callable via
+  `FCALL_RO` (and `FCALL`).
+- **Inputs**:
+  - `KEYS[1]` = source queue **Sorted Set**; `KEYS[2]` = message-key **prefix**; `KEYS[3]` =
+    dead-letter **Sorted Set** *(optional)* — all sharing one hash tag.
+  - `ARGV[1]` = `now`; `ARGV[2]` = `timeout`; `ARGV[3]` = `max_scan` *(optional; `0`/absent = cheap tier only)*.
+- **Behaviour** (no writes): **cheap tier (always)** — `depth` = `ZCARD KEYS[1]`, `dlq_depth` =
+  `ZCARD KEYS[3]` (or `0`), `front_priority` = the front member's score (`-1` when empty). **Bounded tier
+  (`max_scan > 0`)** — scan the front and classify each message via `lease_available`/`is_visible` as
+  `available` / `in_flight` (leased, unexpired) / `delayed` (not yet visible), counting `skipped`
+  (dangling/malformed, never removed) and setting `truncated` when `depth > max_scan`; with a DLQ, also
+  an **approximate** `oldest_dead_letter_age` (`now − min DeadLetteredAt` over the scanned DLQ prefix,
+  flagged by `age_truncated`).
+- **Returns**: a flat map — cheap keys always, breakdown keys only when `max_scan > 0`:
+
+```
+["depth", <int>, "dlq_depth", <int>, "front_priority", <int|-1>,
+ -- when max_scan > 0:
+ "scanned", <int>, "truncated", <0|1>,
+ "available", <int>, "in_flight", <int>, "delayed", <int>, "skipped", <int>,
+ -- when max_scan > 0 and a DLQ key is given:
+ "dlq_scanned", <int>, "oldest_dead_letter_age", <int>, "age_truncated", <0|1>]
+```
+
+- **Commands used**: `ZCARD`, `ZRANGE`, `EXISTS`, `TYPE`, `HMGET`, `HGET` (no writes).
+- **Errors**:
+
+  | Reply | Trigger |
+  |-------|---------|
+  | `MSGFMT EKEYS: two or three keys required` | `#KEYS` ∉ {2,3} |
+  | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
+  | `MSGFMT ETMO: timeout must be a positive integer` | `ARGV[2]` invalid |
+  | `MSGFMT ESCAN: max_scan must be a non-negative integer` | `ARGV[3]` present but invalid |
+  | `MSGFMT ETAG: keys must share one hash tag` | tags differ / missing |
+  | `MSGFMT EMALFORMED: queue is not a sorted set` / `... dead-letter queue is not a sorted set` | `KEYS[1]`/`KEYS[3]` exists, type ≠ `zset` |
+
+```
+FCALL_RO msgfmt_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000
+  -> ["depth",42,"dlq_depth",3,"front_priority",5]                         (cheap tier)
+FCALL_RO msgfmt_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 100
+  -> ["depth",42,"dlq_depth",3,"front_priority",5,"scanned",42,"truncated",0,
+      "available",30,"in_flight",8,"delayed",4,"skipped",0,
+      "dlq_scanned",3,"oldest_dead_letter_age",900,"age_truncated",0]
 ```
 
 ### `msgfmt_validate` — validate candidate field values without storing
@@ -429,12 +523,12 @@ with no `MSGFMT ` prefix (the calling public function adds it).
   and `msgfmt_validate`.
 - **Parameters**: `args` — the flat `name value ...` list (`ARGV`, or `ARGV[3..]` for
   enqueue).
-- **Behaviour**: calls `parse_args(args)`; for each of the six fields in canonical order,
+- **Behaviour**: calls `parse_args(args)`; for each of the seven fields in canonical order,
   uses `encode_field` on the supplied value or falls back to `DEFAULTS[name]`; appends
   `name, stored` to the output.
 - **Returns**:
   - success: a flat list `{ 'ReadAttempts', <enc>, 'DirtyBit', <enc>, 'ReadDateTime', <enc>,
-    'Priority', <enc>, 'Payload', <enc>, 'VisibleAt', <enc> }` (ready to append after `HSET <key>`).
+    'Priority', <enc>, 'Payload', <enc>, 'VisibleAt', <enc>, 'DeadLetteredAt', <enc> }` (ready to append after `HSET <key>`).
   - failure: `(nil, "<CODE>: detail>")` propagated unchanged from `parse_args` or
     `encode_field` — one of `EARGS`, `EFIELD`, `EDUP`, `EINVAL`.
 
@@ -443,7 +537,7 @@ with no `MSGFMT ` prefix (the calling public function adds it).
 - **Purpose**: validate a single field's value and produce its stored string form.
 - **Parameters**: `name` — field name; `value` — raw supplied value.
 - **Behaviour**:
-  - `ReadAttempts` / `ReadDateTime` / `VisibleAt`: `tonumber`, require integer in `0 … 2^53`; store
+  - `ReadAttempts` / `ReadDateTime` / `VisibleAt` / `DeadLetteredAt`: `tonumber`, require integer in `0 … 2^53`; store
     `string.format('%.0f', n)`.
   - `Priority`: `tonumber`, require integer in `-2^53 … 2^53`; store `string.format('%.0f', n)`.
   - `DirtyBit`: lowercased `tostring`; `"1"`/`"true"` → `"1"`, `"0"`/`"false"` → `"0"`.

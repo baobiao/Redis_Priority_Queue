@@ -29,7 +29,7 @@ when `tonumber(value)` returns a finite number `n` (not `nil`, not `NaN`, not `�
 
 One message is stored as a single **Hash** at a **caller-supplied key**
 (`KEYS[1]` for `msgfmt_create`/`msgfmt_read`; `KEYS[2]` for `msgfmt_enqueue`). One Hash =
-one message. The field set is **closed**: exactly these six fields, one Hash field each.
+one message. The field set is **closed**: exactly these seven fields, one Hash field each.
 Supplying any other field name, a duplicate name, or an odd `name value` count is rejected
 and nothing is stored (fail-before-write).
 
@@ -41,6 +41,7 @@ and nothing is stored (fail-before-write).
 | `Priority` | Integer | `1000` | decimal string via `%.0f`, e.g. `"1000"` | integer, `\|n\| ≤ 2^53` (`-2^53 ≤ n ≤ 2^53`) |
 | `Payload` | String | `""` | raw byte string, stored as-is | any byte string (always valid, incl. empty) |
 | `VisibleAt` | Integer ≥ 0 (Unix epoch ms) | `0` | decimal string via `%.0f`, e.g. `"0"` | integer, `0 ≤ n ≤ 2^53` |
+| `DeadLetteredAt` | Integer ≥ 0 (Unix epoch ms) | `0` | decimal string via `%.0f`, e.g. `"0"` | integer, `0 ≤ n ≤ 2^53` |
 
 Semantics:
 
@@ -49,12 +50,15 @@ Semantics:
   before comparison; anything outside the four-token set is `EINVAL: DirtyBit`.
 - **`Priority`: lower value = higher priority.** `Priority` is signed (unlike the two
   non-negative counters); default `1000`.
-- **`VisibleAt` `0` = immediately visible** (no not-before). See §4a — it is the delayed-visibility
+- **`VisibleAt` `0` = immediately visible** (no not-before). See §3a — it is the delayed-visibility
   gate, distinct from the lease visibility timeout.
-- Omitted fields take their default; the message is always written with **all six** fields.
-- **Back-compat**: `VisibleAt` was added in Feature 005. A message stored by Features 001–004 has
-  only the first five fields; readers treat a **missing `VisibleAt` as `0`** (immediately visible)
-  and never error on its absence, so no migration is needed. The five original fields remain
+- **`DeadLetteredAt` `0` = not dead-lettered.** Set to the caller's `now` when `msgfmt_dequeue` moves
+  a message to the dead-letter queue; the retention reaper (§4a) ages entries out by it; `msgfmt_redrive`
+  resets it to `0`.
+- Omitted fields take their default; the message is always written with **all seven** fields.
+- **Back-compat**: `VisibleAt` was added in Feature 005 and `DeadLetteredAt` in Feature 006. A message
+  stored by an earlier feature lacks those fields; readers treat a **missing `VisibleAt` / `DeadLetteredAt`
+  as `0`** and never error on their absence, so no migration is needed. The five original fields remain
   strictly required.
 
 ### Read decoding (round-trip)
@@ -62,8 +66,8 @@ Semantics:
 `msgfmt_read` returns a flat `name value name value ...` array with each field decoded back to
 its logical type:
 
-- `ReadAttempts`, `ReadDateTime`, `Priority`, `VisibleAt` → numbers (`tonumber`); a missing
-  `VisibleAt` (a pre-Feature-005 message) decodes to `0`;
+- `ReadAttempts`, `ReadDateTime`, `Priority`, `VisibleAt`, `DeadLetteredAt` → numbers (`tonumber`); a
+  missing `VisibleAt` (pre-005) or `DeadLetteredAt` (pre-006) decodes to `0`;
 - `Payload` → the raw stored string;
 - `DirtyBit` → **integer `0` or `1`, not a boolean**. RESP2 has no boolean type, and returning
   a Lua `false` would marshal to a nil/absent reply; the integer avoids that `false`→nil
@@ -200,6 +204,40 @@ shares the source queue's hash tag (e.g. source `pq:{q1}`, DLQ `dlq:{q1}`).
 Message-lifecycle transitions added here: `AVAILABLE → (dequeue, ReadAttempts ≥ cap) DEAD-LETTERED`
 and `DEAD-LETTERED → (redrive) AVAILABLE`.
 
+### 4a. Retention — ageing out the DLQ (Feature 006)
+
+To keep the DLQ bounded, dead-lettering now records **when** a message was dead-lettered in the
+`DeadLetteredAt` field (the caller's `now`, stamped by `msgfmt_dequeue`'s dead-letter move — the only
+change to that otherwise index-only move). A message dead-lettered longer ago than a caller-supplied
+**retention window** is permanently removed by **`msgfmt_reap`**:
+
+- Reap examines up to a caller-supplied **`limit`** of DLQ members (bounded execution) and, for each
+  whose `DeadLetteredAt ≤ now − retention`, removes **both** its DLQ member (`ZREM`) and its message
+  Hash (`DEL`) — retention means *permanently gone*, unlike dead-lettering which keeps the Hash. A
+  dangling member (Hash already missing) is cleaned up and counted. Reap returns
+  `{removed, scanned, truncated}`.
+- **Priority-order caveat**: the DLQ stays Priority-scored (Feature 004 unchanged), so reap walks the
+  front *in Priority order*. A small fixed `limit` may not reach expired low-priority entries behind
+  unexpired high-priority ones; to fully drain, size `limit` to the DLQ depth (from `msgfmt_stats`) or
+  page. `now` and `retention` are caller-supplied (no server clock).
+- **Redrive** clears `DeadLetteredAt` back to `0` (the message is no longer dead-lettered).
+
+Transition added: `DEAD-LETTERED → (reap, now − DeadLetteredAt ≥ retention) REMOVED` (member + Hash gone).
+
+### 4b. Observability — `msgfmt_stats` (Feature 006)
+
+`msgfmt_stats` is a read-only (`no-writes`) snapshot of a queue, beyond `msgfmt_peek`'s head view:
+
+- **Cheap tier (always)**: `depth` (`ZCARD` of the queue), `dlq_depth` (`ZCARD` of the DLQ, when given),
+  and `front_priority` (the front member's score; `-1` when empty) — all O(1)/O(log N), no Hash reads.
+- **Bounded tier (`max_scan > 0`)**: a bounded front scan classifying each message as `available` /
+  `in_flight` (leased, unexpired) / `delayed` (not yet visible), with `skipped` (dangling/malformed) and
+  a `truncated` flag when `depth > max_scan`; and — with a DLQ — an **approximate**
+  `oldest_dead_letter_age` (`now − min DeadLetteredAt` over the *scanned* DLQ prefix; approximate
+  because the DLQ is Priority-ordered, flagged by `age_truncated`).
+
+`msgfmt_stats` never writes and never removes dangling members (that is reap's job).
+
 ## 5. Keys & Cluster Co-location
 
 Every key is **caller-supplied via `KEYS[]`**. The library never hardcodes a key name; the one
@@ -254,9 +292,9 @@ unmodified on:
 
 To stay portable the library uses only **commonly-supported commands and options** across all
 four targets. The full data model relies on just: `HSET`, `HGET`, `HMGET`, `HINCRBY`, `EXISTS`,
-`TYPE`, `DEL`, `ZADD`, `ZSCORE`, `ZRANGE`, and `ZREM` — no engine-specific commands, options, or
+`TYPE`, `DEL`, `ZADD`, `ZSCORE`, `ZRANGE`, `ZREM`, and `ZCARD` — no engine-specific commands, options, or
 admin/privileged commands, and no non-deterministic sources: score, member, the lease times
-(`now`, `timeout`), the delivery `cap`, the peek `count`, and the fencing token all derive from
+(`now`, `timeout`), the delivery `cap`, the peek `count`, the retention window, and the fencing token all derive from
 `ARGV` or existing field values, never from server time, counters, or random. This keeps
 behaviour identical whether running standalone or clustered. (Whole-library platform note: the
 `FUNCTION`/`FCALL` family is available on self-hosted Redis/Valkey, node-based ElastiCache, and

@@ -48,6 +48,20 @@ for e in $ENGINES; do
   engine_cli "$e" HSET "q:{rbad}" ReadAttempts 0 DirtyBit 0 ReadDateTime 0 Priority 5 >/dev/null  # no Payload
   out=$(fcall_ro "$e" msgfmt_read 1 "q:{rbad}" 2>&1 || true)
   expect_contains "missing original field still -> EMALFORMED" "EMALFORMED" "$out"
+
+  # --- Feature 006: DeadLetteredAt is the seventh returned field ---
+  engine_cli "$e" DEL "q:{rdla}" >/dev/null
+  fcall "$e" msgfmt_create 1 "q:{rdla}" Priority 5 DeadLetteredAt 7777 >/dev/null
+  out=$(fcall_ro "$e" msgfmt_read 1 "q:{rdla}")
+  expect_contains "read returns DeadLetteredAt label" "DeadLetteredAt" "$out"
+  expect_contains "read returns DeadLetteredAt value" "7777" "$out"
+
+  # A message missing only VisibleAt AND DeadLetteredAt (pre-005/006) reads as 0/0, no error.
+  engine_cli "$e" DEL "q:{rlegacy6}" >/dev/null
+  engine_cli "$e" HSET "q:{rlegacy6}" ReadAttempts 0 DirtyBit 0 ReadDateTime 0 Priority 5 Payload old2 >/dev/null
+  out=$(fcall_ro "$e" msgfmt_read 1 "q:{rlegacy6}")
+  expect_contains "legacy message still reads (Payload)" "old2" "$out"
+  expect_contains "legacy message reports DeadLetteredAt" "DeadLetteredAt" "$out"
 done
 
 finish
