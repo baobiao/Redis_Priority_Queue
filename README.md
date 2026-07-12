@@ -22,6 +22,11 @@ priority queue entirely inside the engine.
   delivery (enqueue with `VisibleAt`) or released with a **retry backoff** (nack with a `VisibleAt`),
   and is skipped by consumers until `now ≥ VisibleAt`. This is distinct from the lease *visibility
   timeout* above.
+- **DLQ retention & observability**: dead-lettering stamps `DeadLetteredAt`, and `msgfmt_reap`
+  permanently ages out dead-lettered messages older than a caller-supplied retention window (bounded
+  per call). `msgfmt_stats` reports aggregate state read-only — queue/DLQ depth and front priority
+  cheaply, plus an optional bounded breakdown (available / in-flight / delayed) and an approximate
+  oldest-dead-letter age.
 - The **same Lua source runs unmodified** on **Redis 7.0+**, **Valkey 7.2+**,
   **Amazon ElastiCache**, and **Amazon MemoryDB**.
 - It is deployed with `FUNCTION LOAD` and invoked with `FCALL` (writes) / `FCALL_RO`
@@ -30,9 +35,9 @@ priority queue entirely inside the engine.
   scanning — appending the runtime `id` to a caller-supplied, co-located key **prefix**
   (constitution Principle IV, amended in v2.0.0).
 
-The current library exposes nine functions: `msgfmt_ack`, `msgfmt_create`, `msgfmt_dequeue`,
-`msgfmt_enqueue`, `msgfmt_nack`, `msgfmt_peek`, `msgfmt_read`, `msgfmt_redrive`, and
-`msgfmt_validate`.
+The current library exposes eleven functions: `msgfmt_ack`, `msgfmt_create`, `msgfmt_dequeue`,
+`msgfmt_enqueue`, `msgfmt_nack`, `msgfmt_peek`, `msgfmt_read`, `msgfmt_reap`, `msgfmt_redrive`,
+`msgfmt_stats`, and `msgfmt_validate`.
 
 See [`docs/schema.md`](docs/schema.md) for the message schema and the native types, and
 [`docs/functions.md`](docs/functions.md) for every function's `KEYS` / `ARGV` / return
@@ -164,7 +169,36 @@ redis-cli FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10
 ```bash
 # KEYS: DLQ, source queue, the message hash (all same tag). ARGV: the member string.
 redis-cli FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
-# -> OK   (back in pq:{q1} at its Priority; NOOP if it was not in the DLQ; VisibleAt reset to 0)
+# -> OK   (back in pq:{q1} at its Priority; NOOP if it was not in the DLQ; VisibleAt/DeadLetteredAt reset to 0)
+```
+
+### Age out the dead-letter queue (retention)
+
+Dead-lettering stamps `DeadLetteredAt`. `msgfmt_reap` permanently removes DLQ entries older than a
+caller-supplied retention window (member + Hash), bounded by a per-call `limit`.
+
+```bash
+# KEYS: DLQ, message-key prefix. ARGV: now, retention (ms), limit.
+redis-cli FCALL msgfmt_reap 2 dlq:{q1} pq:{q1}:m: 1700000000000 86400000 500
+# -> ["removed",7,"scanned",500,"truncated",1]   (removed 7 expired/dangling; loop while truncated=1)
+```
+
+The DLQ stays Priority-ordered, so size `limit` to the DLQ depth (from `msgfmt_stats`) or loop to
+fully drain.
+
+### Observe queue state (read-only stats)
+
+`msgfmt_stats` (read-only, `FCALL_RO`) reports depths + front priority cheaply, plus an optional
+bounded state breakdown when you pass a scan limit.
+
+```bash
+# Cheap: KEYS = queue, prefix, [DLQ]; ARGV = now, timeout.
+redis-cli FCALL_RO msgfmt_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1700000000000 30000
+# -> ["depth",42,"dlq_depth",3,"front_priority",5]
+
+# Bounded breakdown: add max_scan -> available / in_flight / delayed (+ truncated) and approx DLQ age.
+redis-cli FCALL_RO msgfmt_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1700000000000 30000 100
+# -> [... ,"available",30,"in_flight",8,"delayed",4,"skipped",0,"oldest_dead_letter_age",900, ...]
 ```
 
 ### Schedule a message for the future (delayed visibility)

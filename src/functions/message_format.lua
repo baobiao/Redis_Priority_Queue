@@ -10,6 +10,8 @@
 -- Dequeue   : specs/003-dequeue/spec.md (msgfmt_dequeue/ack/nack; contracts/functions.md)
 -- DLQ/Peek  : specs/004-dead-letter-peek/spec.md (dead-letter dequeue + msgfmt_peek/
 --             msgfmt_redrive; contracts/functions.md)
+-- Retention : specs/006-dlq-retention-observability/spec.md (DeadLetteredAt field;
+--             msgfmt_reap + msgfmt_stats; contracts/functions.md)
 -- DelayVis  : specs/005-delayed-visibility/spec.md (VisibleAt not-before field:
 --             scheduled delivery + retry backoff; contracts/functions.md)
 --
@@ -29,31 +31,34 @@
 -- replies, never uncaught Lua errors on validated paths (VIII).
 -- ============================================================================
 
--- VisibleAt (Feature 005) is appended LAST so the stored/read order of the five
--- original fields is preserved and messages written before Feature 005 (which
--- lack VisibleAt) remain readable (a missing VisibleAt is treated as 0 = visible).
-local FIELDS = { 'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload', 'VisibleAt' }
+-- VisibleAt (Feature 005) and DeadLetteredAt (Feature 006) are appended LAST so
+-- the stored/read order of the earlier fields is preserved and messages written
+-- before those features remain readable (a missing VisibleAt is treated as 0 =
+-- visible; a missing DeadLetteredAt as 0 = not dead-lettered).
+local FIELDS = { 'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload', 'VisibleAt', 'DeadLetteredAt' }
 
 -- Literal membership set. Built as a literal (not a load-time loop) because the
 -- Redis Functions sandbox blocks global access (e.g. ipairs) in the top-level
 -- load chunk; loops over FIELDS are only used inside callbacks at runtime.
 local FIELD_SET = {
-  ReadAttempts = true,
-  DirtyBit     = true,
-  ReadDateTime = true,
-  Priority     = true,
-  Payload      = true,
-  VisibleAt    = true,
+  ReadAttempts   = true,
+  DirtyBit       = true,
+  ReadDateTime   = true,
+  Priority       = true,
+  Payload        = true,
+  VisibleAt      = true,
+  DeadLetteredAt = true,
 }
 
 -- Stored (encoded) defaults.
 local DEFAULTS = {
-  ReadAttempts = '0',
-  DirtyBit     = '0',
-  ReadDateTime = '0',
-  Priority     = '1000',
-  Payload      = '',
-  VisibleAt    = '0', -- 0 = immediately visible (no not-before)
+  ReadAttempts   = '0',
+  DirtyBit       = '0',
+  ReadDateTime   = '0',
+  Priority       = '1000',
+  Payload        = '',
+  VisibleAt      = '0', -- 0 = immediately visible (no not-before)
+  DeadLetteredAt = '0', -- 0 = not dead-lettered
 }
 
 local MAX_SAFE_INT = 9007199254740992 -- 2^53; exact-integer ceiling for Lua doubles
@@ -103,7 +108,7 @@ end
 -- Encode a supplied value for storage, validating per field.
 -- Returns (encoded_string, nil) on success or (nil, "ECODE: Field") on failure.
 local function encode_field(name, value)
-  if name == 'ReadAttempts' or name == 'ReadDateTime' or name == 'VisibleAt' then
+  if name == 'ReadAttempts' or name == 'ReadDateTime' or name == 'VisibleAt' or name == 'DeadLetteredAt' then
     local n = tonumber(value)
     if not is_int(n) or n < 0 or n > MAX_SAFE_INT then
       return nil, 'EINVAL: ' .. name
@@ -215,21 +220,22 @@ local function msgfmt_read(keys, args)
     return redis.error_reply('MSGFMT EMALFORMED: key is not a hash')
   end
   local vals = redis.call('HMGET', key,
-    'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload', 'VisibleAt')
-  -- The five original fields remain strictly required; a MISSING VisibleAt (a
-  -- message written before Feature 005) is tolerated and reported as 0 (visible).
+    'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload', 'VisibleAt', 'DeadLetteredAt')
+  -- The five original fields remain strictly required; a MISSING VisibleAt (pre-005)
+  -- or DeadLetteredAt (pre-006) is tolerated and reported as 0.
   for idx = 1, 5 do
     if vals[idx] == false then
       return redis.error_reply('MSGFMT EMALFORMED: missing field ' .. FIELDS[idx])
     end
   end
   return {
-    'ReadAttempts', tonumber(vals[1]),
-    'DirtyBit',     tonumber(vals[2]), -- 0 or 1
-    'ReadDateTime', tonumber(vals[3]),
-    'Priority',     tonumber(vals[4]),
-    'Payload',      vals[5],
-    'VisibleAt',    tonumber(vals[6]) or 0, -- missing -> 0 (immediately visible)
+    'ReadAttempts',   tonumber(vals[1]),
+    'DirtyBit',       tonumber(vals[2]), -- 0 or 1
+    'ReadDateTime',   tonumber(vals[3]),
+    'Priority',       tonumber(vals[4]),
+    'Payload',        vals[5],
+    'VisibleAt',      tonumber(vals[6]) or 0, -- missing -> 0 (immediately visible)
+    'DeadLetteredAt', tonumber(vals[7]) or 0, -- missing -> 0 (not dead-lettered)
   }
 end
 
@@ -425,11 +431,13 @@ local function msgfmt_dequeue(keys, args)
       if lease_available(vals[1], vals[2], now, timeout) and is_visible(vals[6], now) then
         if cap ~= nil and tonumber(vals[3]) >= cap then
           -- Poison: at/over the delivery cap. Move the index to the DLQ (score =
-          -- Priority, member verbatim); the message Hash is left untouched. A plain
-          -- ZADD updates in place if the member already exists (no duplicate). Then
+          -- Priority, member verbatim). A plain ZADD updates in place if the member
+          -- already exists (no duplicate). Stamp DeadLetteredAt=now on the Hash so
+          -- retention (Feature 006) can age it out; no other field is touched. Then
           -- continue scanning for the next deliverable message.
           redis.call('ZREM', queue, member)
           redis.call('ZADD', dlq, vals[4], member)
+          redis.call('HSET', mkey, 'DeadLetteredAt', string.format('%.0f', now))
         else
           local new_ra = redis.call('HINCRBY', mkey, 'ReadAttempts', 1)
           redis.call('HSET', mkey, 'DirtyBit', '1', 'ReadDateTime', string.format('%.0f', now))
@@ -618,7 +626,7 @@ local function msgfmt_peek(keys, args)
         end
       else
         local vals = redis.call('HMGET', mkey,
-          'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload', 'VisibleAt')
+          'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload', 'VisibleAt', 'DeadLetteredAt')
         if vals[1] == false or vals[2] == false or vals[3] == false then
           if topn then
             -- observability: skip a member missing a lease field
@@ -627,14 +635,15 @@ local function msgfmt_peek(keys, args)
           end
         else
           local record = {
-            'id',           id,
-            'member',       member,
-            'DirtyBit',     tonumber(vals[1]),
-            'ReadAttempts', tonumber(vals[3]),
-            'ReadDateTime', tonumber(vals[2]),
-            'Priority',     tonumber(vals[4]),
-            'Payload',      vals[5],
-            'VisibleAt',    tonumber(vals[6]) or 0, -- missing -> 0 (immediately visible)
+            'id',             id,
+            'member',         member,
+            'DirtyBit',       tonumber(vals[1]),
+            'ReadAttempts',   tonumber(vals[3]),
+            'ReadDateTime',   tonumber(vals[2]),
+            'Priority',       tonumber(vals[4]),
+            'Payload',        vals[5],
+            'VisibleAt',      tonumber(vals[6]) or 0, -- missing -> 0 (immediately visible)
+            'DeadLetteredAt', tonumber(vals[7]) or 0, -- missing -> 0 (not dead-lettered)
           }
           if topn then
             results[#results + 1] = record -- top-N reports every member, regardless of visibility
@@ -707,8 +716,221 @@ local function msgfmt_redrive(keys, args)
   redis.call('ZADD', queue, priority, member)
   -- Reset delivery state so the redriven message is immediately deliverable;
   -- VisibleAt=0 clears any not-before. ReadDateTime is retained.
-  redis.call('HSET', mkey, 'ReadAttempts', '0', 'DirtyBit', '0', 'VisibleAt', '0')
+  redis.call('HSET', mkey, 'ReadAttempts', '0', 'DirtyBit', '0', 'VisibleAt', '0', 'DeadLetteredAt', '0')
   return redis.status_reply('OK')
+end
+
+-- ---------------------------------------------------------------------------
+-- msgfmt_reap  (WRITE) — Feature 006 DLQ retention.
+--   KEYS[1] = dead-letter Sorted Set ; KEYS[2] = message-key prefix (same tag).
+--   ARGV[1] = now ; ARGV[2] = retention (ms window) ; ARGV[3] = limit (>= 1).
+--   Examines up to `limit` DLQ front members (Priority order) and permanently
+--   removes (ZREM member + DEL Hash) those whose DeadLetteredAt <= now-retention,
+--   plus any dangling member (Hash missing, cleaned). Returns the flat map
+--   {removed, scanned, truncated} (truncated=1 when ZCARD > limit). Bounded per
+--   call; the caller loops / sizes `limit` to the DLQ depth (from msgfmt_stats) to
+--   drain. Fail-before-write on validation.
+-- ---------------------------------------------------------------------------
+local function msgfmt_reap(keys, args)
+  if #keys ~= 2 then
+    return redis.error_reply('MSGFMT EKEYS: exactly two keys required')
+  end
+  local dlq = keys[1]
+  local prefix = keys[2]
+
+  local now = tonumber(args[1])
+  if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ENOW: now must be a non-negative integer')
+  end
+  local retention = tonumber(args[2])
+  if not is_int(retention) or retention < 0 or retention > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ERET: retention must be a non-negative integer')
+  end
+  local limit = tonumber(args[3])
+  if not is_int(limit) or limit < 1 or limit > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ELIMIT: limit must be a positive integer')
+  end
+
+  local dtag = hash_tag(dlq)
+  local ptag = hash_tag(prefix)
+  if dtag == nil or ptag == nil or dtag ~= ptag then
+    return redis.error_reply('MSGFMT ETAG: dead-letter queue and message-key prefix must share one hash tag')
+  end
+
+  if redis.call('EXISTS', dlq) == 0 then
+    return { 'removed', 0, 'scanned', 0, 'truncated', 0 }
+  end
+  local dt = redis.call('TYPE', dlq)
+  if dt.ok ~= 'zset' then
+    return redis.error_reply('MSGFMT EMALFORMED: dead-letter queue is not a sorted set')
+  end
+
+  local cutoff = now - retention -- expired iff DeadLetteredAt <= cutoff
+  local card = redis.call('ZCARD', dlq)
+  local members = redis.call('ZRANGE', dlq, 0, limit - 1)
+  local removed = 0
+  local scanned = 0
+  for _, member in ipairs(members) do
+    scanned = scanned + 1
+    local colon = string.find(member, ':', 1, true)
+    local id = colon and string.sub(member, colon + 1) or member
+    local mkey = prefix .. id
+    if redis.call('EXISTS', mkey) == 0 then
+      redis.call('ZREM', dlq, member) -- dangling member -> clean up
+      removed = removed + 1
+    else
+      local dla = tonumber(redis.call('HGET', mkey, 'DeadLetteredAt')) or 0
+      if dla <= cutoff then
+        redis.call('ZREM', dlq, member)
+        redis.call('DEL', mkey)
+        removed = removed + 1
+      end
+    end
+  end
+  local truncated = 0
+  if card > limit then truncated = 1 end
+  return { 'removed', removed, 'scanned', scanned, 'truncated', truncated }
+end
+
+-- ---------------------------------------------------------------------------
+-- msgfmt_stats  (NO-WRITES; callable via FCALL_RO) — Feature 006 observability.
+--   KEYS[1] = source queue Sorted Set ; KEYS[2] = message-key prefix ;
+--   KEYS[3] = dead-letter Sorted Set (optional). ARGV[1] = now ; ARGV[2] =
+--   timeout ; ARGV[3] = max_scan (optional; 0/absent = cheap tier only).
+--   Cheap tier (always): depth=ZCARD(queue), dlq_depth=ZCARD(dlq) or 0,
+--   front_priority = the front member's score (-1 when the queue is empty).
+--   Bounded tier (max_scan>0): scan the front and classify each message as
+--   available / in_flight (leased, unexpired) / delayed (not yet visible), with
+--   skipped (dangling/malformed) and truncated; and, with a DLQ, an approximate
+--   oldest_dead_letter_age from the scanned DLQ prefix. Performs no writes.
+-- ---------------------------------------------------------------------------
+local function msgfmt_stats(keys, args)
+  if #keys ~= 2 and #keys ~= 3 then
+    return redis.error_reply('MSGFMT EKEYS: two or three keys required')
+  end
+  local queue = keys[1]
+  local prefix = keys[2]
+  local dlq = keys[3] -- may be nil
+
+  local now = tonumber(args[1])
+  if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ENOW: now must be a non-negative integer')
+  end
+  local timeout = tonumber(args[2])
+  if not is_int(timeout) or timeout < 1 or timeout > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ETMO: timeout must be a positive integer')
+  end
+  local max_scan = 0
+  if args[3] ~= nil then
+    max_scan = tonumber(args[3])
+    if not is_int(max_scan) or max_scan < 0 or max_scan > MAX_SAFE_INT then
+      return redis.error_reply('MSGFMT ESCAN: max_scan must be a non-negative integer')
+    end
+  end
+
+  local qtag = hash_tag(queue)
+  local ptag = hash_tag(prefix)
+  if qtag == nil or ptag == nil or qtag ~= ptag then
+    return redis.error_reply('MSGFMT ETAG: keys must share one hash tag')
+  end
+  if dlq ~= nil then
+    local dtag = hash_tag(dlq)
+    if dtag == nil or dtag ~= qtag then
+      return redis.error_reply('MSGFMT ETAG: keys must share one hash tag')
+    end
+  end
+
+  if redis.call('EXISTS', queue) == 1 then
+    local qt = redis.call('TYPE', queue)
+    if qt.ok ~= 'zset' then
+      return redis.error_reply('MSGFMT EMALFORMED: queue is not a sorted set')
+    end
+  end
+  if dlq ~= nil and redis.call('EXISTS', dlq) == 1 then
+    local dt = redis.call('TYPE', dlq)
+    if dt.ok ~= 'zset' then
+      return redis.error_reply('MSGFMT EMALFORMED: dead-letter queue is not a sorted set')
+    end
+  end
+
+  -- Cheap tier (O(1)/O(log N); no per-message reads).
+  local depth = redis.call('ZCARD', queue)
+  local dlq_depth = 0
+  if dlq ~= nil then dlq_depth = redis.call('ZCARD', dlq) end
+  local front_priority = -1 -- -1 = empty queue
+  local front = redis.call('ZRANGE', queue, 0, 0, 'WITHSCORES')
+  if front[2] ~= nil then front_priority = tonumber(front[2]) end
+
+  local out = { 'depth', depth, 'dlq_depth', dlq_depth, 'front_priority', front_priority }
+
+  if max_scan > 0 then
+    -- Bounded state breakdown over the source-queue front (each message is
+    -- exactly one of in_flight / delayed / available; dangling/malformed -> skipped).
+    local available, in_flight, delayed, skipped = 0, 0, 0, 0
+    local members = redis.call('ZRANGE', queue, 0, max_scan - 1)
+    for _, member in ipairs(members) do
+      local colon = string.find(member, ':', 1, true)
+      local id = colon and string.sub(member, colon + 1) or member
+      local mkey = prefix .. id
+      if redis.call('EXISTS', mkey) == 0 then
+        skipped = skipped + 1
+      else
+        local mt = redis.call('TYPE', mkey)
+        if mt.ok ~= 'hash' then
+          skipped = skipped + 1
+        else
+          local v = redis.call('HMGET', mkey, 'DirtyBit', 'ReadDateTime', 'VisibleAt')
+          if v[1] == false then
+            skipped = skipped + 1
+          elseif not lease_available(v[1], v[2], now, timeout) then
+            in_flight = in_flight + 1
+          elseif not is_visible(v[3], now) then
+            delayed = delayed + 1
+          else
+            available = available + 1
+          end
+        end
+      end
+    end
+    local truncated = 0
+    if depth > max_scan then truncated = 1 end
+    out[#out + 1] = 'scanned';   out[#out + 1] = #members
+    out[#out + 1] = 'truncated'; out[#out + 1] = truncated
+    out[#out + 1] = 'available'; out[#out + 1] = available
+    out[#out + 1] = 'in_flight'; out[#out + 1] = in_flight
+    out[#out + 1] = 'delayed';   out[#out + 1] = delayed
+    out[#out + 1] = 'skipped';   out[#out + 1] = skipped
+
+    -- Approximate oldest-dead-letter age from the scanned DLQ prefix (the DLQ is
+    -- Priority-ordered, so this is the min DeadLetteredAt over the scanned front,
+    -- not necessarily the global oldest -> flagged via age_truncated).
+    if dlq ~= nil then
+      local dmembers = redis.call('ZRANGE', dlq, 0, max_scan - 1)
+      local dlq_scanned = 0
+      local min_dla = nil
+      for _, member in ipairs(dmembers) do
+        dlq_scanned = dlq_scanned + 1
+        local colon = string.find(member, ':', 1, true)
+        local id = colon and string.sub(member, colon + 1) or member
+        local mkey = prefix .. id
+        if redis.call('EXISTS', mkey) == 1 then
+          local dla = tonumber(redis.call('HGET', mkey, 'DeadLetteredAt'))
+          if dla ~= nil and dla > 0 and (min_dla == nil or dla < min_dla) then
+            min_dla = dla
+          end
+        end
+      end
+      local age = 0
+      if min_dla ~= nil then age = now - min_dla end
+      local age_truncated = 0
+      if dlq_depth > max_scan then age_truncated = 1 end
+      out[#out + 1] = 'dlq_scanned';            out[#out + 1] = dlq_scanned
+      out[#out + 1] = 'oldest_dead_letter_age'; out[#out + 1] = age
+      out[#out + 1] = 'age_truncated';          out[#out + 1] = age_truncated
+    end
+  end
+
+  return out
 end
 
 redis.register_function('msgfmt_create', msgfmt_create)
@@ -732,3 +954,9 @@ redis.register_function{
   flags         = { 'no-writes' },
 }
 redis.register_function('msgfmt_redrive', msgfmt_redrive)
+redis.register_function('msgfmt_reap', msgfmt_reap)
+redis.register_function{
+  function_name = 'msgfmt_stats',
+  callback      = msgfmt_stats,
+  flags         = { 'no-writes' },
+}
