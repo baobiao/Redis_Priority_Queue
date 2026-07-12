@@ -8,6 +8,8 @@
 -- Contracts : specs/001-message-format/contracts/functions.md
 -- Enqueue   : specs/002-enqueue/spec.md (msgfmt_enqueue; contracts/functions.md)
 -- Dequeue   : specs/003-dequeue/spec.md (msgfmt_dequeue/ack/nack; contracts/functions.md)
+-- DLQ/Peek  : specs/004-dead-letter-peek/spec.md (dead-letter dequeue + msgfmt_peek/
+--             msgfmt_redrive; contracts/functions.md)
 --
 -- A message is stored as a single Redis/Valkey Hash (one field per attribute)
 -- at a caller-supplied key (KEYS[1]). The same source runs unmodified on
@@ -64,6 +66,22 @@ local function hash_tag(key)
   local close = string.find(key, '}', open + 1, true)
   if not close or close == open + 1 then return nil end
   return string.sub(key, open + 1, close - 1)
+end
+
+-- Is a message currently available to lease? Available = not in-flight
+-- (DirtyBit '0'), or in-flight ('1') with an EXPIRED lease
+-- (now - ReadDateTime >= timeout). Shared by msgfmt_dequeue (which then leases)
+-- and msgfmt_peek (which reports the next deliverable) so both agree exactly on
+-- which message is "next". Determinism: now/timeout are caller-supplied via ARGV
+-- (Principle VII); no server clock is read here.
+local function lease_available(dirtybit, readdatetime, now, timeout)
+  if dirtybit == '0' then
+    return true
+  elseif dirtybit == '1' then
+    local rdt = tonumber(readdatetime)
+    return rdt ~= nil and (now - rdt) >= timeout
+  end
+  return false
 end
 
 -- Encode a supplied value for storage, validating per field.
@@ -289,11 +307,18 @@ end
 --   KEYS[2] .. id (the sanctioned same-slot construction). Fail-before-write.
 -- ---------------------------------------------------------------------------
 local function msgfmt_dequeue(keys, args)
-  if #keys ~= 2 then
-    return redis.error_reply('MSGFMT EKEYS: exactly two keys required')
+  -- KEYS[1]=source queue, KEYS[2]=message-key prefix, KEYS[3]=DLQ (optional).
+  -- With KEYS[3] present (dead-letter mode) ARGV[4]=cap is required: an available
+  -- candidate whose ReadAttempts >= cap is moved to the DLQ (index-only, score =
+  -- Priority, member verbatim) instead of being leased, and the scan continues.
+  -- With only 2 keys the behaviour is exactly Feature 003. See
+  -- specs/004-dead-letter-peek/contracts/functions.md.
+  if #keys ~= 2 and #keys ~= 3 then
+    return redis.error_reply('MSGFMT EKEYS: two or three keys required')
   end
   local queue = keys[1]
   local prefix = keys[2]
+  local dlq = keys[3] -- nil in Feature 003 mode
 
   local now = tonumber(args[1])
   if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
@@ -310,6 +335,13 @@ local function msgfmt_dequeue(keys, args)
       return redis.error_reply('MSGFMT ESCAN: max_scan must be a non-negative integer')
     end
   end
+  local cap = nil
+  if dlq ~= nil then
+    cap = tonumber(args[4])
+    if not is_int(cap) or cap < 1 or cap > MAX_SAFE_INT then
+      return redis.error_reply('MSGFMT ECAP: cap must be a positive integer')
+    end
+  end
 
   -- Co-location: queue and message-key prefix must share one hash tag so every
   -- constructed KEYS[2]..id lands in the queue's slot (Principle IV / cluster-safe).
@@ -318,6 +350,13 @@ local function msgfmt_dequeue(keys, args)
   if qtag == nil or ptag == nil or qtag ~= ptag then
     return redis.error_reply('MSGFMT ETAG: queue and message-key prefix must share one hash tag')
   end
+  if dlq ~= nil then
+    -- The DLQ takes writes in the same call, so it must share the queue's slot.
+    local dtag = hash_tag(dlq)
+    if dtag == nil or dtag ~= qtag then
+      return redis.error_reply('MSGFMT ETAG: dead-letter queue must share the queue hash tag')
+    end
+  end
 
   if redis.call('EXISTS', queue) == 0 then
     return false -- empty queue -> nothing available (RESP null)
@@ -325,6 +364,12 @@ local function msgfmt_dequeue(keys, args)
   local qt = redis.call('TYPE', queue)
   if qt.ok ~= 'zset' then
     return redis.error_reply('MSGFMT EMALFORMED: queue is not a sorted set')
+  end
+  if dlq ~= nil and redis.call('EXISTS', dlq) == 1 then
+    local dt = redis.call('TYPE', dlq)
+    if dt.ok ~= 'zset' then
+      return redis.error_reply('MSGFMT EMALFORMED: dead-letter queue is not a sorted set')
+    end
   end
 
   -- Walk the front ascending (lowest score first, ties by member byte order = FIFO).
@@ -353,26 +398,26 @@ local function msgfmt_dequeue(keys, args)
       if vals[1] == false or vals[2] == false or vals[3] == false then
         return redis.error_reply('MSGFMT EMALFORMED: message ' .. mkey .. ' missing lease field')
       end
-      local available = false
-      if vals[1] == '0' then
-        available = true
-      elseif vals[1] == '1' then
-        local rdt = tonumber(vals[2])
-        if rdt ~= nil and (now - rdt) >= timeout then
-          available = true -- expired lease -> reclaim
+      if lease_available(vals[1], vals[2], now, timeout) then
+        if cap ~= nil and tonumber(vals[3]) >= cap then
+          -- Poison: at/over the delivery cap. Move the index to the DLQ (score =
+          -- Priority, member verbatim); the message Hash is left untouched. A plain
+          -- ZADD updates in place if the member already exists (no duplicate). Then
+          -- continue scanning for the next deliverable message.
+          redis.call('ZREM', queue, member)
+          redis.call('ZADD', dlq, vals[4], member)
+        else
+          local new_ra = redis.call('HINCRBY', mkey, 'ReadAttempts', 1)
+          redis.call('HSET', mkey, 'DirtyBit', '1', 'ReadDateTime', string.format('%.0f', now))
+          return {
+            'id',           id,
+            'member',       member,
+            'ReadAttempts', new_ra, -- fencing token
+            'ReadDateTime', now,
+            'Priority',     tonumber(vals[4]),
+            'Payload',      vals[5],
+          }
         end
-      end
-      if available then
-        local new_ra = redis.call('HINCRBY', mkey, 'ReadAttempts', 1)
-        redis.call('HSET', mkey, 'DirtyBit', '1', 'ReadDateTime', string.format('%.0f', now))
-        return {
-          'id',           id,
-          'member',       member,
-          'ReadAttempts', new_ra, -- fencing token
-          'ReadDateTime', now,
-          'Priority',     tonumber(vals[4]),
-          'Payload',      vals[5],
-        }
       end
     end
   end
@@ -457,6 +502,170 @@ local function msgfmt_nack(keys, args)
   return redis.status_reply('OK')
 end
 
+-- ---------------------------------------------------------------------------
+-- msgfmt_peek  (NO-WRITES; callable via FCALL_RO)
+--   KEYS[1] = queue Sorted Set to inspect (a source queue or a DLQ).
+--   KEYS[2] = message-key prefix (same hash tag as KEYS[1]).
+--   ARGV[1] = now ; ARGV[2] = timeout ; ARGV[3] = count (optional).
+--   No count (or count=1) -> SINGLE mode: return the front AVAILABLE message
+--   (exactly what msgfmt_dequeue would lease next), as a record, WITHOUT mutating
+--   anything; null when nothing is deliverable. count=N -> TOP-N mode: up to N
+--   front members in priority-then-FIFO order regardless of lease state, each a
+--   record annotated with its lease fields. Dangling/malformed members are
+--   SKIPPED (never removed - this is a read-only function). Fail-before-return.
+--   A record is a flat array:
+--     {id, member, DirtyBit(0|1), ReadAttempts, ReadDateTime, Priority, Payload}.
+-- ---------------------------------------------------------------------------
+local function msgfmt_peek(keys, args)
+  if #keys ~= 2 then
+    return redis.error_reply('MSGFMT EKEYS: exactly two keys required')
+  end
+  local queue = keys[1]
+  local prefix = keys[2]
+
+  local now = tonumber(args[1])
+  if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ENOW: now must be a non-negative integer')
+  end
+  local timeout = tonumber(args[2])
+  if not is_int(timeout) or timeout < 1 or timeout > MAX_SAFE_INT then
+    return redis.error_reply('MSGFMT ETMO: timeout must be a positive integer')
+  end
+  local count = 1
+  local topn = false
+  if args[3] ~= nil then
+    count = tonumber(args[3])
+    if not is_int(count) or count < 1 or count > MAX_SAFE_INT then
+      return redis.error_reply('MSGFMT ECOUNT: count must be a positive integer')
+    end
+    if count > 1 then topn = true end
+  end
+
+  local qtag = hash_tag(queue)
+  local ptag = hash_tag(prefix)
+  if qtag == nil or ptag == nil or qtag ~= ptag then
+    return redis.error_reply('MSGFMT ETAG: queue and message-key prefix must share one hash tag')
+  end
+
+  if redis.call('EXISTS', queue) == 0 then
+    if topn then return {} else return false end
+  end
+  local qt = redis.call('TYPE', queue)
+  if qt.ok ~= 'zset' then
+    return redis.error_reply('MSGFMT EMALFORMED: queue is not a sorted set')
+  end
+
+  -- Top-N fetches only the front `count` members; single mode scans the front
+  -- (bounded by queue size) to skip leased/dangling and find the first available.
+  local stop = -1
+  if topn then stop = count - 1 end
+  local members = redis.call('ZRANGE', queue, 0, stop)
+
+  local results = {}
+  for _, member in ipairs(members) do
+    local colon = string.find(member, ':', 1, true)
+    local id = colon and string.sub(member, colon + 1) or member
+    local mkey = prefix .. id
+
+    if redis.call('EXISTS', mkey) == 1 then
+      local mt = redis.call('TYPE', mkey)
+      if mt.ok ~= 'hash' then
+        if topn then
+          -- observability: skip a malformed member
+        else
+          return redis.error_reply('MSGFMT EMALFORMED: message ' .. mkey .. ' is not a hash')
+        end
+      else
+        local vals = redis.call('HMGET', mkey,
+          'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload')
+        if vals[1] == false or vals[2] == false or vals[3] == false then
+          if topn then
+            -- observability: skip a member missing a lease field
+          else
+            return redis.error_reply('MSGFMT EMALFORMED: message ' .. mkey .. ' missing lease field')
+          end
+        else
+          local record = {
+            'id',           id,
+            'member',       member,
+            'DirtyBit',     tonumber(vals[1]),
+            'ReadAttempts', tonumber(vals[3]),
+            'ReadDateTime', tonumber(vals[2]),
+            'Priority',     tonumber(vals[4]),
+            'Payload',      vals[5],
+          }
+          if topn then
+            results[#results + 1] = record
+          elseif lease_available(vals[1], vals[2], now, timeout) then
+            return record -- single mode: the front deliverable message
+          end
+        end
+      end
+    end
+    -- dangling member (Hash absent): skip; never ZREM (read-only)
+  end
+
+  if topn then
+    return results
+  end
+  return false -- single mode: nothing deliverable
+end
+
+-- ---------------------------------------------------------------------------
+-- msgfmt_redrive  (WRITE)
+--   KEYS[1] = dead-letter Sorted Set (source of the move).
+--   KEYS[2] = source priority-queue Sorted Set (destination).
+--   KEYS[3] = the message Hash (passed literally; the id is known to the caller).
+--   ARGV[1] = member (the exact DLQ member string to move).
+--   Moves one member DLQ -> source at score = Priority (member verbatim) and
+--   resets delivery state: ReadAttempts=0, DirtyBit=0, retaining ReadDateTime.
+--   NOOP when the member is not in the DLQ; EQDUP when it is already in the
+--   source. Fail-before-write. All three keys must share one hash tag.
+-- ---------------------------------------------------------------------------
+local function msgfmt_redrive(keys, args)
+  if #keys ~= 3 then
+    return redis.error_reply('MSGFMT EKEYS: exactly three keys required')
+  end
+  local dlq = keys[1]
+  local queue = keys[2]
+  local mkey = keys[3]
+  local member = args[1]
+  if member == nil or member == '' then
+    return redis.error_reply('MSGFMT EARGS: member required')
+  end
+
+  local dtag = hash_tag(dlq)
+  local qtag = hash_tag(queue)
+  local mtag = hash_tag(mkey)
+  if dtag == nil or qtag == nil or mtag == nil or dtag ~= qtag or dtag ~= mtag then
+    return redis.error_reply('MSGFMT ETAG: keys must share one hash tag')
+  end
+
+  -- Guards, all before any write:
+  if redis.call('ZSCORE', dlq, member) == false then
+    return redis.status_reply('NOOP') -- not in the dead-letter queue
+  end
+  if redis.call('ZSCORE', queue, member) ~= false then
+    return redis.error_reply('MSGFMT EQDUP: already present in source queue')
+  end
+  if redis.call('EXISTS', mkey) == 0 then
+    return redis.error_reply('MSGFMT EMALFORMED: message hash missing')
+  end
+  local mt = redis.call('TYPE', mkey)
+  if mt.ok ~= 'hash' then
+    return redis.error_reply('MSGFMT EMALFORMED: key is not a hash')
+  end
+  local priority = redis.call('HGET', mkey, 'Priority')
+  if priority == false then
+    return redis.error_reply('MSGFMT EMALFORMED: missing field Priority')
+  end
+
+  redis.call('ZREM', dlq, member)
+  redis.call('ZADD', queue, priority, member)
+  redis.call('HSET', mkey, 'ReadAttempts', '0', 'DirtyBit', '0') -- retain ReadDateTime
+  return redis.status_reply('OK')
+end
+
 redis.register_function('msgfmt_create', msgfmt_create)
 redis.register_function{
   function_name = 'msgfmt_read',
@@ -472,3 +681,9 @@ redis.register_function('msgfmt_enqueue', msgfmt_enqueue)
 redis.register_function('msgfmt_dequeue', msgfmt_dequeue)
 redis.register_function('msgfmt_ack', msgfmt_ack)
 redis.register_function('msgfmt_nack', msgfmt_nack)
+redis.register_function{
+  function_name = 'msgfmt_peek',
+  callback      = msgfmt_peek,
+  flags         = { 'no-writes' },
+}
+redis.register_function('msgfmt_redrive', msgfmt_redrive)

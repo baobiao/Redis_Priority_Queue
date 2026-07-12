@@ -31,6 +31,15 @@ for e in $ENGINES; do
   out=$(fcall_ro "$e" msgfmt_nack 1 "pq:{flag}:m:1" 1 2>&1 || true)
   expect_contains "nack rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
 
+  # msgfmt_redrive is a write and must be rejected under FCALL_RO (Feature 004).
+  out=$(fcall_ro "$e" msgfmt_redrive 3 "dlq:{flag}" "pq:{flag}" "pq:{flag}:m:1" "00000000000000000001:1" 2>&1 || true)
+  expect_contains "redrive rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
+
+  # msgfmt_peek is registered no-writes and IS callable via FCALL_RO (Feature 004).
+  engine_cli "$e" DEL "pq:{flag}" >/dev/null
+  out=$(fcall_ro "$e" msgfmt_peek 2 "pq:{flag}" "pq:{flag}:m:" 1000 30000 2>&1 || true)
+  expect "peek callable via FCALL_RO (empty -> null)" "" "$out"
+
   # Reader works under the read-only command.
   engine_cli "$e" DEL "q:{flag}" >/dev/null
   fcall "$e" msgfmt_create 1 "q:{flag}" >/dev/null

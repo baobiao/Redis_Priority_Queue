@@ -14,15 +14,21 @@ priority queue entirely inside the engine.
   (release for redelivery on failure). An unsettled lease is reclaimed after a
   caller-supplied **visibility timeout**, and a **fencing token** stops a stale consumer
   from settling a message that has since been reacquired.
+- **Poison messages** are capped: with an optional dead-letter queue and a maximum-delivery
+  cap, `msgfmt_dequeue` moves an over-cap message aside to a **dead-letter queue** instead of
+  redelivering it; `msgfmt_redrive` sends one back to the source, and `msgfmt_peek` inspects any
+  queue read-only (single next-deliverable, or a top-N view).
 - The **same Lua source runs unmodified** on **Redis 7.0+**, **Valkey 7.2+**,
   **Amazon ElastiCache**, and **Amazon MemoryDB**.
 - It is deployed with `FUNCTION LOAD` and invoked with `FCALL` (writes) / `FCALL_RO`
-  (reads). Every key is caller-supplied via `KEYS[]`; the one sanctioned exception is
-  `msgfmt_dequeue`, which appends the runtime message `id` to a caller-supplied,
-  co-located key **prefix** (constitution Principle IV, amended in v2.0.0).
+  (reads). Every key is caller-supplied via `KEYS[]`; the one sanctioned exception is the
+  runtime key construction `msgfmt_dequeue`/`msgfmt_peek` use to reach a message discovered by
+  scanning — appending the runtime `id` to a caller-supplied, co-located key **prefix**
+  (constitution Principle IV, amended in v2.0.0).
 
-The current library exposes seven functions: `msgfmt_ack`, `msgfmt_create`,
-`msgfmt_dequeue`, `msgfmt_enqueue`, `msgfmt_nack`, `msgfmt_read`, and `msgfmt_validate`.
+The current library exposes nine functions: `msgfmt_ack`, `msgfmt_create`, `msgfmt_dequeue`,
+`msgfmt_enqueue`, `msgfmt_nack`, `msgfmt_peek`, `msgfmt_read`, `msgfmt_redrive`, and
+`msgfmt_validate`.
 
 See [`docs/schema.md`](docs/schema.md) for the message schema and the native types, and
 [`docs/functions.md`](docs/functions.md) for every function's `KEYS` / `ARGV` / return
@@ -116,6 +122,47 @@ If a consumer crashes without settling, the next `msgfmt_dequeue` whose `now` is
 and issuing a new token); the crashed consumer's old token is then rejected with
 `MSGFMT EFENCED`.
 
+### Dead-letter poison messages (optional)
+
+A message that always fails is redelivered indefinitely. To cap that, pass an extra key
+(`KEYS[3]` = a dead-letter Sorted Set, same hash tag) and a trailing `cap` argument. When
+`msgfmt_dequeue` reaches an available message whose `ReadAttempts` has already reached the cap,
+it moves that message to the dead-letter queue instead of delivering it, and returns the next
+deliverable message (silently). The message Hash is left in place; only the index moves.
+
+```bash
+# Dead-letter mode: max 5 deliveries. Pass max_scan (0 = unbounded) then the cap.
+redis-cli FCALL msgfmt_dequeue 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 0 5
+# -> the next deliverable handle, or (nil); any front message with ReadAttempts>=5
+#    is moved to dlq:{q1} at its Priority (verbatim member) on the way.
+```
+
+Omitting `KEYS[3]` and the cap makes `msgfmt_dequeue` behave exactly as the 2-key call above.
+
+### Inspect a queue without consuming (peek)
+
+`msgfmt_peek` is read-only (`FCALL_RO`). With no `count` it returns the single message a dequeue
+would lease next (lease-aware); with a `count` it returns the front N entries and their state,
+regardless of lease. It works on a source queue or a dead-letter queue and mutates nothing.
+
+```bash
+# The next deliverable message (no mutation):
+redis-cli FCALL_RO msgfmt_peek 2 pq:{q1} pq:{q1}:m: 1000 30000
+# The front 10 entries of the DLQ with their lease fields:
+redis-cli FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10
+```
+
+### Redrive a message from the dead-letter queue
+
+`msgfmt_redrive` moves one message from a DLQ back to its source and resets its delivery state
+(`ReadAttempts=0`, `DirtyBit=0`, `ReadDateTime` retained) so it is reprocessed from a clean slate.
+
+```bash
+# KEYS: DLQ, source queue, the message hash (all same tag). ARGV: the member string.
+redis-cli FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
+# -> OK   (back in pq:{q1} at its Priority; NOOP if it was not in the DLQ)
+```
+
 ### Create a standalone message (no queue index)
 
 ```bash
@@ -126,10 +173,10 @@ redis-cli FCALL msgfmt_create 1 q:{m2} Payload "order-42" Priority 5
 # -> OK
 ```
 
-`msgfmt_read` and `msgfmt_validate` are `no-writes` and callable with `FCALL_RO`;
-`msgfmt_create`, `msgfmt_enqueue`, `msgfmt_dequeue`, `msgfmt_ack`, and `msgfmt_nack` are
-writes and are rejected under `FCALL_RO`. All failures return a structured `MSGFMT E...`
-error, and every write is fail-before-write — nothing is written on any error.
+`msgfmt_read`, `msgfmt_validate`, and `msgfmt_peek` are `no-writes` and callable with `FCALL_RO`;
+`msgfmt_create`, `msgfmt_enqueue`, `msgfmt_dequeue`, `msgfmt_ack`, `msgfmt_nack`, and
+`msgfmt_redrive` are writes and are rejected under `FCALL_RO`. All failures return a structured
+`MSGFMT E...` error, and every write is fail-before-write — nothing is written on any error.
 
 ## Run the tests locally
 

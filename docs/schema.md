@@ -136,32 +136,69 @@ message is an idempotent `NOOP`; settling a non-leased message is `ENOTLEASED`.
 
 **Lifecycle**: `AVAILABLE → (dequeue) LEASED → (ack) REMOVED`, or `LEASED → (nack) AVAILABLE`,
 with `LEASED → (timeout) reclaimable`. `ReadAttempts` records how many times a message has been
-delivered — the signal a future dead-letter feature would use (capping is out of scope here;
-redelivery is currently unbounded).
+delivered; when a dead-letter queue and a delivery cap are supplied (Feature 004, §4), an
+available message whose `ReadAttempts` has reached the cap is moved to the dead-letter queue on
+its next dequeue instead of being delivered again.
 
-## 4. Keys & Cluster Co-location
+## 4. The Dead-Letter Queue (DLQ) — poison-message handling
+
+A **dead-letter queue** is just another priority-queue **Sorted Set**, structurally identical to a
+source queue, that holds messages which reached a caller-supplied maximum-delivery **cap**. It
+shares the source queue's hash tag (e.g. source `pq:{q1}`, DLQ `dlq:{q1}`).
+
+- **Dead-lettering** happens inside `msgfmt_dequeue` when called with an optional DLQ key
+  (`KEYS[3]`) and a `cap`: while scanning the front, an **available** message
+  (`DirtyBit=0`, or an expired lease) whose `ReadAttempts ≥ cap` is **moved index-only** — removed
+  from the source (`ZREM`) and added to the DLQ (`ZADD`) with **score = its `Priority`** and the
+  **member string preserved verbatim**. The message **Hash is never modified or moved**. The scan
+  then continues, so the consumer transparently receives the next deliverable message (or null); a
+  message currently in-flight with an **unexpired** lease is never dead-lettered. Omitting the DLQ
+  key/cap makes `msgfmt_dequeue` behave exactly as Feature 003.
+- Because the DLQ has the identical shape (score = `Priority`, verbatim member, Hash in place), it
+  is itself **peek-able and dequeue-able** with the same functions.
+- **Redrive** (`msgfmt_redrive`) is the reverse move for one message: `ZREM` from the DLQ, `ZADD`
+  back to the source at `score = Priority` (member verbatim), and reset the delivery state —
+  `ReadAttempts = 0`, `DirtyBit = 0` — while **retaining `ReadDateTime`** (a forensic record of the
+  last processing time). It is a `NOOP` if the member is not in the DLQ, and rejected (`EQDUP`) if
+  the member is already in the source (no duplicate index).
+- **Peek** (`msgfmt_peek`) is a read-only inspection of any such queue and never mutates or removes
+  anything (it skips dangling members rather than cleaning them up).
+
+Message-lifecycle transitions added here: `AVAILABLE → (dequeue, ReadAttempts ≥ cap) DEAD-LETTERED`
+and `DEAD-LETTERED → (redrive) AVAILABLE`.
+
+## 5. Keys & Cluster Co-location
 
 Every key is **caller-supplied via `KEYS[]`**. The library never hardcodes a key name; the one
-sanctioned construction is `msgfmt_dequeue` appending the runtime `id` to a caller-supplied,
-co-located prefix (see below). `msgfmt_enqueue` takes two keys:
+sanctioned construction is appending the runtime `id` to a caller-supplied, co-located prefix —
+done by `msgfmt_dequeue` and `msgfmt_peek` for a message discovered by scanning (whose id is not
+knowable in advance). `msgfmt_redrive` addresses a message whose id the caller knows, so it takes
+the message Hash key **literally**. `msgfmt_enqueue` takes two keys:
 
 - `KEYS[1]` = the priority-queue **Sorted Set**;
 - `KEYS[2]` = the message **Hash**.
 
-Because a single `FCALL` touches both keys, on a clustered deployment they **must hash to the
+`msgfmt_dequeue` in dead-letter mode adds `KEYS[3]` = the **dead-letter Sorted Set**, and
+`msgfmt_redrive` takes the DLQ, the source queue, and the message Hash — in every case **all keys
+in one call share a single hash tag**.
+
+Because a single `FCALL` touches multiple keys, on a clustered deployment they **must hash to the
 same slot**, which requires a **shared hash tag** — the substring between the first `{` and `}`
 in each key. Only that substring is hashed, so two keys with the same tag always co-locate.
 
 ```
 KEYS[1] = pq:{q1}          # the queue Sorted Set
-KEYS[2] = pq:{q1}:m:42     # the message Hash  (same tag "q1" -> same slot)
+KEYS[2] = pq:{q1}:m:42     # the message Hash   (same tag "q1" -> same slot)
+KEYS[3] = dlq:{q1}         # the dead-letter Sorted Set (same tag "q1", dead-letter dequeue)
 ```
 
 `msgfmt_dequeue` takes `KEYS[1]` = the queue Sorted Set and `KEYS[2]` = the message-key
 **prefix** (e.g. `pq:{q1}:m:`), and reaches each candidate message at `KEYS[2] .. id`. It first
-checks that the prefix carries the queue's hash tag (else `MSGFMT ETAG`), so every constructed
-key — e.g. `pq:{q1}:m:42` — lands in the queue's slot. `msgfmt_ack` receives the queue and the
-specific message Hash directly in `KEYS[]`; `msgfmt_nack` receives only the message Hash.
+checks that the prefix (and, in dead-letter mode, the DLQ key `KEYS[3]`) carries the queue's hash
+tag (else `MSGFMT ETAG`), so every constructed key — e.g. `pq:{q1}:m:42` — lands in the queue's
+slot. `msgfmt_peek` takes the same queue + prefix and constructs keys read-only. `msgfmt_ack` and
+`msgfmt_redrive` receive the specific message Hash directly in `KEYS[]`; `msgfmt_nack` receives
+only the message Hash.
 
 Amazon **ElastiCache** and **MemoryDB** always run in cluster mode and **reject cross-slot
 multi-key access with a `CROSSSLOT` error**. Callers that omit or mismatch the hash tag
@@ -172,7 +209,7 @@ transiently return `TRYAGAIN`/`ASK`; clients should retry.
 
 ---
 
-## 5. Portability
+## 6. Portability
 
 A **single, identical Lua source** (`src/functions/message_format.lua`) is designed to run
 unmodified on:
@@ -183,9 +220,11 @@ unmodified on:
 - **Amazon MemoryDB**
 
 To stay portable the library uses only **commonly-supported commands and options** across all
-four targets. The full data model relies on just: `HSET`, `HMGET`, `HINCRBY`, `EXISTS`, `TYPE`,
-`DEL`, `ZADD`, `ZSCORE`, `ZRANGE`, and `ZREM` — no engine-specific commands, options, or
+four targets. The full data model relies on just: `HSET`, `HGET`, `HMGET`, `HINCRBY`, `EXISTS`,
+`TYPE`, `DEL`, `ZADD`, `ZSCORE`, `ZRANGE`, and `ZREM` — no engine-specific commands, options, or
 admin/privileged commands, and no non-deterministic sources: score, member, the lease times
-(`now`, `timeout`), and the fencing token all derive from `ARGV` or existing field values,
-never from server time, counters, or random. This keeps behaviour identical whether running
-standalone or clustered.
+(`now`, `timeout`), the delivery `cap`, the peek `count`, and the fencing token all derive from
+`ARGV` or existing field values, never from server time, counters, or random. This keeps
+behaviour identical whether running standalone or clustered. (Whole-library platform note: the
+`FUNCTION`/`FCALL` family is available on self-hosted Redis/Valkey, node-based ElastiCache, and
+MemoryDB 7.x, but **not** on ElastiCache Serverless.)
