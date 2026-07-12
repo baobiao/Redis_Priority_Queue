@@ -28,6 +28,26 @@ for e in $ENGINES; do
   engine_cli "$e" SET "q:{wrong}" notahash >/dev/null
   out=$(fcall_ro "$e" msgfmt_read 1 "q:{wrong}" 2>&1 || true)
   expect_contains "wrong-type key -> EMALFORMED" "EMALFORMED" "$out"
+
+  # --- Feature 005: VisibleAt is the sixth returned field ---
+  engine_cli "$e" DEL "q:{rv}" >/dev/null
+  fcall "$e" msgfmt_create 1 "q:{rv}" Priority 5 VisibleAt 4242 >/dev/null
+  out=$(fcall_ro "$e" msgfmt_read 1 "q:{rv}")
+  expect_contains "read returns VisibleAt label" "VisibleAt" "$out"
+  expect_contains "read returns VisibleAt value" "4242" "$out"
+
+  # A message missing ONLY VisibleAt (stored before Feature 005) reads as VisibleAt=0, no error.
+  engine_cli "$e" DEL "q:{rlegacy}" >/dev/null
+  engine_cli "$e" HSET "q:{rlegacy}" ReadAttempts 0 DirtyBit 0 ReadDateTime 0 Priority 5 Payload old >/dev/null
+  out=$(fcall_ro "$e" msgfmt_read 1 "q:{rlegacy}")
+  expect_contains "legacy 5-field message still reads (Payload)" "old" "$out"
+  expect_contains "legacy message reports VisibleAt" "VisibleAt" "$out"
+
+  # A message missing an ORIGINAL field still -> EMALFORMED (only VisibleAt is tolerated).
+  engine_cli "$e" DEL "q:{rbad}" >/dev/null
+  engine_cli "$e" HSET "q:{rbad}" ReadAttempts 0 DirtyBit 0 ReadDateTime 0 Priority 5 >/dev/null  # no Payload
+  out=$(fcall_ro "$e" msgfmt_read 1 "q:{rbad}" 2>&1 || true)
+  expect_contains "missing original field still -> EMALFORMED" "EMALFORMED" "$out"
 done
 
 finish

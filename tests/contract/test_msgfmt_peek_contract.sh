@@ -45,6 +45,20 @@ for e in $ENGINES; do
   expect_contains "bad count -> ECOUNT" "ECOUNT" "$out"
   out=$(fcall_ro "$e" msgfmt_peek 2 "pq:{pc}" "pq:{other}:m:" 1000 30000 2>&1 || true)
   expect_contains "tag mismatch -> ETAG" "ETAG" "$out"
+
+  # --- Feature 005: records carry VisibleAt; single mode honours it ---
+  vq="pq:{pcv}"; vpfx="pq:{pcv}:m:"
+  engine_cli "$e" DEL "$vq" "${vpfx}h" >/dev/null
+  fcall "$e" msgfmt_enqueue 2 "$vq" "${vpfx}h" h 1 Priority 5 Payload hid VisibleAt 9000 >/dev/null
+  # top-N reports the record with its VisibleAt
+  out=$(fcall_ro "$e" msgfmt_peek 2 "$vq" "$vpfx" 1000 30000 5)
+  expect_contains "top-N record carries VisibleAt label" "VisibleAt" "$out"
+  expect_contains "top-N record carries VisibleAt value" "9000" "$out"
+  # single mode skips it while hidden, returns it once visible
+  out=$(fcall_ro "$e" msgfmt_peek 2 "$vq" "$vpfx" 8999 30000)
+  expect "single peek skips not-yet-visible -> null" "" "$out"
+  out=$(fcall_ro "$e" msgfmt_peek 2 "$vq" "$vpfx" 9000 30000)
+  expect_contains "single peek returns it once visible" "hid" "$out"
 done
 
 finish

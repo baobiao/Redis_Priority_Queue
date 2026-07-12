@@ -19,8 +19,15 @@ runtime (constitution Principle IV, amended v2.0.0). Field/value pairs are suppl
 | `ReadDateTime` | integer ≥ 0 (epoch ms) | `0` | integer, `0 … 2^53` | decimal string |
 | `Priority` | integer (lower = higher priority) | `1000` | integer, `-2^53 … 2^53` | decimal string |
 | `Payload` | string | `""` | none (any value accepted) | `tostring(value)` |
+| `VisibleAt` | integer ≥ 0 (epoch ms) | `0` | integer, `0 … 2^53` | decimal string |
 
 `2^53` is `MAX_SAFE_INT = 9007199254740992`, the exact-integer ceiling for Lua doubles.
+
+`VisibleAt` (Feature 005) is a **not-before time**: a message is not deliverable until `now ≥
+VisibleAt` (`0` = immediately visible). It is distinct from the lease *visibility timeout* (which
+reclaims an in-flight message). It flows through the normal field path, so `msgfmt_create` and
+`msgfmt_enqueue` accept it as a field with no signature change; a **missing** `VisibleAt` (a message
+stored before Feature 005) is treated as `0`.
 
 ## Error convention
 
@@ -126,12 +133,15 @@ FCALL msgfmt_create 1 pq:{m1} Color red               -> MSGFMT EFIELD: Color
   `EMALFORMED`; a present `KEYS[3]` that is not a `zset` → `EMALFORMED`. Walk the front ascending
   (`ZRANGE`, lowest score first, ties by member = FIFO). For each member derive `id` and read
   `mkey = KEYS[2] .. id`: a **dangling** member (Hash absent) is `ZREM`'d and skipped; a
-  malformed candidate → `EMALFORMED`. A message is **available** when `DirtyBit=0`, or
-  `DirtyBit=1` with `now − ReadDateTime ≥ timeout` (an expired lease it reclaims). For the first
-  available message: **in dead-letter mode, if `ReadAttempts ≥ cap`** it is moved to the DLQ
-  (`ZREM KEYS[1] member`, `ZADD KEYS[3] <Priority> member` — the Hash is untouched) and the scan
-  **continues**; otherwise it is leased — `HINCRBY ReadAttempts 1`, `HSET DirtyBit 1 ReadDateTime now`
-  — and returned.
+  malformed candidate → `EMALFORMED`. A message is **deliverable** when it is lease-available —
+  `DirtyBit=0`, or `DirtyBit=1` with `now − ReadDateTime ≥ timeout` (an expired lease it reclaims) —
+  **and** `now ≥ VisibleAt` (the Feature 005 not-before gate; a missing `VisibleAt` is treated as
+  `0`). A not-yet-visible message is skipped (counts against `max_scan`), like an unexpired lease.
+  For the first deliverable message: **in dead-letter mode, if `ReadAttempts ≥ cap`** it is moved to
+  the DLQ (`ZREM KEYS[1] member`, `ZADD KEYS[3] <Priority> member` — the Hash is untouched) and the
+  scan **continues**; otherwise it is leased — `HINCRBY ReadAttempts 1`, `HSET DirtyBit 1 ReadDateTime
+  now` — and returned. (Because the cap check runs only after the visibility gate, a not-yet-visible
+  over-cap message is not dead-lettered until it becomes visible.)
 - **Score / lease**: the returned `ReadAttempts` is the **fencing token** for the settle call.
   Dead-lettering is **silent** — the reply is the next deliverable handle or null, exactly as
   Feature 003 (no count of dead-lettered messages is returned).
@@ -227,11 +237,15 @@ re-run same call        -> MSGFMT EEXISTS: message location occupied
   its original position, preserving the record that it was read.
 - **Write / callability**: **WRITE** (registered with no flags). Call via `FCALL`.
 - **Inputs**: `KEYS[1]` = message **Hash** (`<prefix><id>`). `ARGV[1]` = `token` (the fencing
-  token). The queue member is **not** touched (it was never removed), so no queue key is needed.
-- **Behaviour** (fail-before-write): if `KEYS[1]` is absent → idempotent `NOOP`; if not a hash /
-  missing lease fields → `EMALFORMED`; if `DirtyBit ≠ 1` → `ENOTLEASED`; if `ReadAttempts ≠
-  token` → `EFENCED`; otherwise `HSET KEYS[1] DirtyBit 0` (retaining `ReadDateTime` and
-  `ReadAttempts`).
+  token). `ARGV[2]` = `VisibleAt` *(optional; Feature 005)* — a non-negative integer epoch ms for a
+  delayed retry (backoff). The queue member is **not** touched (it was never removed), so no queue
+  key is needed.
+- **Behaviour** (fail-before-write): validate `token`, and if `ARGV[2]` is present validate it
+  (`EVIS`). If `KEYS[1]` is absent → idempotent `NOOP`; if not a hash / missing lease fields →
+  `EMALFORMED`; if `DirtyBit ≠ 1` → `ENOTLEASED`; if `ReadAttempts ≠ token` → `EFENCED`; otherwise
+  release: `HSET KEYS[1] DirtyBit 0` (retaining `ReadDateTime`/`ReadAttempts`). When `VisibleAt` is
+  supplied it is set in the same `HSET` (retry backoff — the message is hidden until `now ≥ VisibleAt`);
+  when omitted, `VisibleAt` is left unchanged (Feature 003 behaviour).
 - **Returns**: `redis.status_reply("OK")`, or `redis.status_reply("NOOP")` when already settled.
 - **Commands used**: `EXISTS`, `TYPE`, `HMGET`, `HSET`.
 - **Errors**:
@@ -240,14 +254,17 @@ re-run same call        -> MSGFMT EEXISTS: message location occupied
   |-------|---------|
   | `MSGFMT EKEYS: exactly one key required` | `#KEYS ≠ 1` |
   | `MSGFMT EARGS: token required` | non-integer `token` |
+  | `MSGFMT EVIS: visibleAt must be a non-negative integer` | `ARGV[2]` present and non-integer / `< 0` / `> 2^53` |
   | `MSGFMT EMALFORMED: key is not a hash` | `KEYS[1]` exists, type ≠ `hash` |
   | `MSGFMT EMALFORMED: missing lease field` | `DirtyBit`/`ReadAttempts` absent |
   | `MSGFMT ENOTLEASED: message not in-flight` | `DirtyBit = 0` |
   | `MSGFMT EFENCED: lease superseded` | `ReadAttempts ≠ token` |
 
 ```
-FCALL msgfmt_nack 1 pq:{q1}:m:2 1   -> OK    (DirtyBit->0; available again; ReadAttempts kept)
-FCALL msgfmt_nack 1 pq:{q1}:m:2 1   -> ENOTLEASED   (already released)
+FCALL msgfmt_nack 1 pq:{q1}:m:2 1        -> OK    (DirtyBit->0; available now; ReadAttempts kept)
+FCALL msgfmt_nack 1 pq:{q1}:m:2 1 90000  -> OK    (retry backoff: hidden until now >= 90000)
+FCALL msgfmt_nack 1 pq:{q1}:m:2 1 -5     -> MSGFMT EVIS: visibleAt must be a non-negative integer
+FCALL msgfmt_nack 1 pq:{q1}:m:2 1        -> ENOTLEASED   (already released)
 ```
 
 ### `msgfmt_peek` — inspect a queue without consuming
@@ -262,17 +279,18 @@ FCALL msgfmt_nack 1 pq:{q1}:m:2 1   -> ENOTLEASED   (already released)
   - `ARGV[3]` = `count` *(optional)* — positive integer. Absent or `1` → **single mode**; `N` → **top-N mode**.
 - **Behaviour** (no writes): validate keys/args and the shared tag; absent `KEYS[1]` → null
   (single) / empty array (top-N); non-`zset` → `EMALFORMED`. **Single mode** walks the front and
-  returns the first **available** message (same rule as `msgfmt_dequeue`, lease-aware) as a record,
-  without mutating it; null if none. **Top-N mode** returns up to `count` front members in
-  priority-then-FIFO order **regardless of lease state**, each a record. Dangling members (Hash
-  absent) are **skipped and never removed** (read-only); a malformed Hash errors in single mode if
-  it is the selected candidate, and is skipped in top-N mode.
+  returns the first **deliverable** message — the same rule as `msgfmt_dequeue`: lease-available
+  **and** `now ≥ VisibleAt` (not-yet-visible messages are skipped) — as a record, without mutating
+  it; null if none. **Top-N mode** returns up to `count` front members in priority-then-FIFO order
+  **regardless of lease/visibility state** (so not-yet-visible members are reported), each a record.
+  Dangling members (Hash absent) are **skipped and never removed** (read-only); a malformed Hash
+  errors in single mode if it is the selected candidate, and is skipped in top-N mode.
 - **Returns**: single mode — one **record** array, or null; top-N mode — an **array of records**
-  (`0 … count`). A record is:
+  (`0 … count`). A record is (note `VisibleAt`, Feature 005):
 
 ```
 ["id", <id>, "member", <member>, "DirtyBit", <0|1>, "ReadAttempts", <int>,
- "ReadDateTime", <int>, "Priority", <int>, "Payload", <bytes>]
+ "ReadDateTime", <int>, "Priority", <int>, "Payload", <bytes>, "VisibleAt", <int>]
 ```
 
 - **Commands used**: `EXISTS`, `TYPE`, `ZRANGE`, `HMGET` (no writes).
@@ -303,16 +321,19 @@ FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10  (inspect the DLQ)
   Callable via `FCALL_RO` (and `FCALL`).
 - **Inputs**: `KEYS[1]` = message Hash key. No `ARGV`.
 - **Behaviour**: if the key is absent, return `NOTFOUND`; if it exists but is not a Hash
-  or is missing any field, return `EMALFORMED`; otherwise `HMGET` all five fields and
-  decode them.
-- **Returns**: a flat, RESP map-style array of field/value pairs with decoded values:
+  or is missing any of the **five original** fields, return `EMALFORMED`; otherwise `HMGET`
+  the fields and decode them. A **missing `VisibleAt`** (a message stored before Feature 005)
+  is tolerated and decoded as `0` (immediately visible) — it does **not** cause `EMALFORMED`.
+- **Returns**: a flat, RESP map-style array of field/value pairs with decoded values (six pairs
+  since Feature 005):
 
 ```
 ["ReadAttempts", <int>,
  "DirtyBit",     <0|1>,
  "ReadDateTime", <int>,
  "Priority",     <int>,
- "Payload",      <string>]
+ "Payload",      <string>,
+ "VisibleAt",    <int>]
 ```
 
   **Why `DirtyBit` is integer `0`/`1`, not a Lua boolean**: RESP2 has no boolean type,
@@ -325,11 +346,11 @@ FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10  (inspect the DLQ)
   | `NOTFOUND` | status | key does not exist |
   | `MSGFMT EKEYS: exactly one key required` | error | `#KEYS ≠ 1` |
   | `MSGFMT EMALFORMED: key is not a hash` | error | key exists but `TYPE ≠ hash` |
-  | `MSGFMT EMALFORMED: missing field <Field>` | error | a required field is absent (`HMGET` returned `false`) |
+  | `MSGFMT EMALFORMED: missing field <Field>` | error | one of the five **original** fields is absent (`HMGET` returned `false`); a missing `VisibleAt` is NOT an error |
 
 ```
 FCALL_RO msgfmt_read 1 pq:{m1}   (after default create)
-  -> ["ReadAttempts",0,"DirtyBit",0,"ReadDateTime",0,"Priority",1000,"Payload",""]
+  -> ["ReadAttempts",0,"DirtyBit",0,"ReadDateTime",0,"Priority",1000,"Payload","","VisibleAt",0]
 FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
 ```
 
@@ -347,8 +368,9 @@ FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
   `ZSCORE KEYS[1] member` nil → **`NOOP`** (not in the DLQ); `ZSCORE KEYS[2] member` non-nil →
   **`EQDUP`** (already in the source); `KEYS[3]` absent / not a hash / missing `Priority` →
   `EMALFORMED`. Otherwise, in one atomic call: `ZREM KEYS[1] member`, `ZADD KEYS[2] <Priority> member`
-  (score read from the Hash, member verbatim), `HSET KEYS[3] ReadAttempts 0 DirtyBit 0` — **`ReadDateTime`
-  is retained**.
+  (score read from the Hash, member verbatim), `HSET KEYS[3] ReadAttempts 0 DirtyBit 0 VisibleAt 0` —
+  **`ReadDateTime` is retained**; `VisibleAt` is reset to `0` so the redriven message is immediately
+  visible (Feature 005).
 - **Returns**: `redis.status_reply("OK")` on a move; `redis.status_reply("NOOP")` when the member was
   not in the DLQ.
 - **Commands used**: `ZSCORE`, `EXISTS`, `TYPE`, `HGET`, `ZREM`, `ZADD`, `HSET`.
@@ -366,7 +388,7 @@ FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
 
 ```
 FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
-  -> OK    (member back in pq:{q1} at its Priority; hash reset RA=0/DB=0, ReadDateTime kept)
+  -> OK    (member back in pq:{q1} at its Priority; hash reset RA=0/DB=0/VisibleAt=0, ReadDateTime kept)
 FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
   -> NOOP  (already redriven; no longer in the DLQ)
 ```
@@ -407,12 +429,12 @@ with no `MSGFMT ` prefix (the calling public function adds it).
   and `msgfmt_validate`.
 - **Parameters**: `args` — the flat `name value ...` list (`ARGV`, or `ARGV[3..]` for
   enqueue).
-- **Behaviour**: calls `parse_args(args)`; for each of the five fields in canonical order,
+- **Behaviour**: calls `parse_args(args)`; for each of the six fields in canonical order,
   uses `encode_field` on the supplied value or falls back to `DEFAULTS[name]`; appends
   `name, stored` to the output.
 - **Returns**:
   - success: a flat list `{ 'ReadAttempts', <enc>, 'DirtyBit', <enc>, 'ReadDateTime', <enc>,
-    'Priority', <enc>, 'Payload', <enc> }` (ready to append after `HSET <key>`).
+    'Priority', <enc>, 'Payload', <enc>, 'VisibleAt', <enc> }` (ready to append after `HSET <key>`).
   - failure: `(nil, "<CODE>: detail>")` propagated unchanged from `parse_args` or
     `encode_field` — one of `EARGS`, `EFIELD`, `EDUP`, `EINVAL`.
 
@@ -421,7 +443,7 @@ with no `MSGFMT ` prefix (the calling public function adds it).
 - **Purpose**: validate a single field's value and produce its stored string form.
 - **Parameters**: `name` — field name; `value` — raw supplied value.
 - **Behaviour**:
-  - `ReadAttempts` / `ReadDateTime`: `tonumber`, require integer in `0 … 2^53`; store
+  - `ReadAttempts` / `ReadDateTime` / `VisibleAt`: `tonumber`, require integer in `0 … 2^53`; store
     `string.format('%.0f', n)`.
   - `Priority`: `tonumber`, require integer in `-2^53 … 2^53`; store `string.format('%.0f', n)`.
   - `DirtyBit`: lowercased `tostring`; `"1"`/`"true"` → `"1"`, `"0"`/`"false"` → `"0"`.

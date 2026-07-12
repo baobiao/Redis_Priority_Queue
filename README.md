@@ -18,6 +18,10 @@ priority queue entirely inside the engine.
   cap, `msgfmt_dequeue` moves an over-cap message aside to a **dead-letter queue** instead of
   redelivering it; `msgfmt_redrive` sends one back to the source, and `msgfmt_peek` inspects any
   queue read-only (single next-deliverable, or a top-N view).
+- **Delayed visibility** (`VisibleAt`, a not-before time): a message can be **scheduled** for future
+  delivery (enqueue with `VisibleAt`) or released with a **retry backoff** (nack with a `VisibleAt`),
+  and is skipped by consumers until `now ≥ VisibleAt`. This is distinct from the lease *visibility
+  timeout* above.
 - The **same Lua source runs unmodified** on **Redis 7.0+**, **Valkey 7.2+**,
   **Amazon ElastiCache**, and **Amazon MemoryDB**.
 - It is deployed with `FUNCTION LOAD` and invoked with `FCALL` (writes) / `FCALL_RO`
@@ -160,7 +164,31 @@ redis-cli FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10
 ```bash
 # KEYS: DLQ, source queue, the message hash (all same tag). ARGV: the member string.
 redis-cli FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
-# -> OK   (back in pq:{q1} at its Priority; NOOP if it was not in the DLQ)
+# -> OK   (back in pq:{q1} at its Priority; NOOP if it was not in the DLQ; VisibleAt reset to 0)
+```
+
+### Schedule a message for the future (delayed visibility)
+
+`VisibleAt` (epoch ms; `0` = immediately visible) is a **not-before** time — the message is skipped
+by consumers until `now ≥ VisibleAt`. It is just a field on enqueue (no new argument). This is
+**distinct** from the lease *visibility timeout*.
+
+```bash
+# Deliverable only at/after now=60000.
+redis-cli FCALL msgfmt_enqueue 2 pq:{q1} pq:{q1}:m:9 9 9 Priority 5 Payload later VisibleAt 60000
+redis-cli FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 59999 30000   # -> (nil)   (not visible yet)
+redis-cli FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 60000 30000   # -> ["id","9", ...]   (now visible)
+```
+
+### Retry with a backoff delay
+
+Nack a failed message with a `VisibleAt` (a 2nd `ARGV` after the token) so it is redelivered only
+after a backoff — instead of immediately. The caller computes `VisibleAt = now + delay`.
+
+```bash
+# ... after leasing the message (token = 1) and failing to process it:
+redis-cli FCALL msgfmt_nack 1 pq:{q1}:m:9 1 90000
+# -> OK   (released now, but hidden until now >= 90000; ReadDateTime/ReadAttempts retained)
 ```
 
 ### Create a standalone message (no queue index)

@@ -10,6 +10,8 @@
 -- Dequeue   : specs/003-dequeue/spec.md (msgfmt_dequeue/ack/nack; contracts/functions.md)
 -- DLQ/Peek  : specs/004-dead-letter-peek/spec.md (dead-letter dequeue + msgfmt_peek/
 --             msgfmt_redrive; contracts/functions.md)
+-- DelayVis  : specs/005-delayed-visibility/spec.md (VisibleAt not-before field:
+--             scheduled delivery + retry backoff; contracts/functions.md)
 --
 -- A message is stored as a single Redis/Valkey Hash (one field per attribute)
 -- at a caller-supplied key (KEYS[1]). The same source runs unmodified on
@@ -27,7 +29,10 @@
 -- replies, never uncaught Lua errors on validated paths (VIII).
 -- ============================================================================
 
-local FIELDS = { 'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload' }
+-- VisibleAt (Feature 005) is appended LAST so the stored/read order of the five
+-- original fields is preserved and messages written before Feature 005 (which
+-- lack VisibleAt) remain readable (a missing VisibleAt is treated as 0 = visible).
+local FIELDS = { 'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload', 'VisibleAt' }
 
 -- Literal membership set. Built as a literal (not a load-time loop) because the
 -- Redis Functions sandbox blocks global access (e.g. ipairs) in the top-level
@@ -38,6 +43,7 @@ local FIELD_SET = {
   ReadDateTime = true,
   Priority     = true,
   Payload      = true,
+  VisibleAt    = true,
 }
 
 -- Stored (encoded) defaults.
@@ -47,6 +53,7 @@ local DEFAULTS = {
   ReadDateTime = '0',
   Priority     = '1000',
   Payload      = '',
+  VisibleAt    = '0', -- 0 = immediately visible (no not-before)
 }
 
 local MAX_SAFE_INT = 9007199254740992 -- 2^53; exact-integer ceiling for Lua doubles
@@ -84,10 +91,19 @@ local function lease_available(dirtybit, readdatetime, now, timeout)
   return false
 end
 
+-- Delayed visibility (Feature 005), DISTINCT from the lease visibility timeout
+-- above: a message is not deliverable until now >= its not-before time VisibleAt.
+-- A missing/nil VisibleAt (a message stored before Feature 005) coalesces to 0 =
+-- immediately visible. now is caller-supplied via ARGV (Principle VII; no clock).
+-- A message is deliverable only when lease_available(...) AND is_visible(...).
+local function is_visible(visibleat, now)
+  return (tonumber(visibleat) or 0) <= now
+end
+
 -- Encode a supplied value for storage, validating per field.
 -- Returns (encoded_string, nil) on success or (nil, "ECODE: Field") on failure.
 local function encode_field(name, value)
-  if name == 'ReadAttempts' or name == 'ReadDateTime' then
+  if name == 'ReadAttempts' or name == 'ReadDateTime' or name == 'VisibleAt' then
     local n = tonumber(value)
     if not is_int(n) or n < 0 or n > MAX_SAFE_INT then
       return nil, 'EINVAL: ' .. name
@@ -199,7 +215,9 @@ local function msgfmt_read(keys, args)
     return redis.error_reply('MSGFMT EMALFORMED: key is not a hash')
   end
   local vals = redis.call('HMGET', key,
-    'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload')
+    'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload', 'VisibleAt')
+  -- The five original fields remain strictly required; a MISSING VisibleAt (a
+  -- message written before Feature 005) is tolerated and reported as 0 (visible).
   for idx = 1, 5 do
     if vals[idx] == false then
       return redis.error_reply('MSGFMT EMALFORMED: missing field ' .. FIELDS[idx])
@@ -211,6 +229,7 @@ local function msgfmt_read(keys, args)
     'ReadDateTime', tonumber(vals[3]),
     'Priority',     tonumber(vals[4]),
     'Payload',      vals[5],
+    'VisibleAt',    tonumber(vals[6]) or 0, -- missing -> 0 (immediately visible)
   }
 end
 
@@ -394,11 +413,16 @@ local function msgfmt_dequeue(keys, args)
         return redis.error_reply('MSGFMT EMALFORMED: message ' .. mkey .. ' is not a hash')
       end
       local vals = redis.call('HMGET', mkey,
-        'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload')
+        'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload', 'VisibleAt')
       if vals[1] == false or vals[2] == false or vals[3] == false then
         return redis.error_reply('MSGFMT EMALFORMED: message ' .. mkey .. ' missing lease field')
       end
-      if lease_available(vals[1], vals[2], now, timeout) then
+      -- Deliverable only when lease-available AND visible (now >= VisibleAt). A
+      -- missing VisibleAt (vals[6]) coalesces to 0 = visible (back-compat). A
+      -- not-yet-visible message is skipped like an unexpired lease; the dead-letter
+      -- cap check below runs only AFTER this gate, so a not-yet-visible over-cap
+      -- message is not dead-lettered until it becomes visible.
+      if lease_available(vals[1], vals[2], now, timeout) and is_visible(vals[6], now) then
         if cap ~= nil and tonumber(vals[3]) >= cap then
           -- Poison: at/over the delivery cap. Move the index to the DLQ (score =
           -- Priority, member verbatim); the message Hash is left untouched. A plain
@@ -467,10 +491,14 @@ end
 
 -- ---------------------------------------------------------------------------
 -- msgfmt_nack  (WRITE)
---   KEYS[1] = message Hash. ARGV[1] = token (fencing).
+--   KEYS[1] = message Hash. ARGV[1] = token (fencing). ARGV[2] = VisibleAt
+--   (OPTIONAL, non-negative integer epoch ms; Feature 005 retry backoff).
 --   On a valid current lease releases it: DirtyBit=0, retaining ReadDateTime and
 --   ReadAttempts, so the message becomes available again at its original position
---   (the queue member is never removed). Idempotent NOOP if already gone; fenced.
+--   (the queue member is never removed). When ARGV[2] is supplied, also sets
+--   VisibleAt so the message is not redelivered until now >= VisibleAt (delayed
+--   retry); when omitted, VisibleAt is left unchanged. Idempotent NOOP if already
+--   gone; fenced.
 -- ---------------------------------------------------------------------------
 local function msgfmt_nack(keys, args)
   if #keys ~= 1 then
@@ -480,6 +508,14 @@ local function msgfmt_nack(keys, args)
   local token = tonumber(args[1])
   if not is_int(token) then
     return redis.error_reply('MSGFMT EARGS: token required')
+  end
+  -- Optional not-before (retry backoff). Validate up front (fail-before-write).
+  local visible_at = nil
+  if args[2] ~= nil then
+    visible_at = tonumber(args[2])
+    if not is_int(visible_at) or visible_at < 0 or visible_at > MAX_SAFE_INT then
+      return redis.error_reply('MSGFMT EVIS: visibleAt must be a non-negative integer')
+    end
   end
   if redis.call('EXISTS', mkey) == 0 then
     return redis.status_reply('NOOP') -- already settled
@@ -498,7 +534,12 @@ local function msgfmt_nack(keys, args)
   if tonumber(vals[2]) ~= token then
     return redis.error_reply('MSGFMT EFENCED: lease superseded')
   end
-  redis.call('HSET', mkey, 'DirtyBit', '0') -- retain ReadDateTime and ReadAttempts
+  if visible_at ~= nil then
+    -- Retry backoff: release AND hide until now >= VisibleAt.
+    redis.call('HSET', mkey, 'DirtyBit', '0', 'VisibleAt', string.format('%.0f', visible_at))
+  else
+    redis.call('HSET', mkey, 'DirtyBit', '0') -- retain ReadDateTime/ReadAttempts/VisibleAt
+  end
   return redis.status_reply('OK')
 end
 
@@ -577,7 +618,7 @@ local function msgfmt_peek(keys, args)
         end
       else
         local vals = redis.call('HMGET', mkey,
-          'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload')
+          'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload', 'VisibleAt')
         if vals[1] == false or vals[2] == false or vals[3] == false then
           if topn then
             -- observability: skip a member missing a lease field
@@ -593,11 +634,12 @@ local function msgfmt_peek(keys, args)
             'ReadDateTime', tonumber(vals[2]),
             'Priority',     tonumber(vals[4]),
             'Payload',      vals[5],
+            'VisibleAt',    tonumber(vals[6]) or 0, -- missing -> 0 (immediately visible)
           }
           if topn then
-            results[#results + 1] = record
-          elseif lease_available(vals[1], vals[2], now, timeout) then
-            return record -- single mode: the front deliverable message
+            results[#results + 1] = record -- top-N reports every member, regardless of visibility
+          elseif lease_available(vals[1], vals[2], now, timeout) and is_visible(vals[6], now) then
+            return record -- single mode: the front deliverable (lease-available AND visible) message
           end
         end
       end
@@ -618,9 +660,10 @@ end
 --   KEYS[3] = the message Hash (passed literally; the id is known to the caller).
 --   ARGV[1] = member (the exact DLQ member string to move).
 --   Moves one member DLQ -> source at score = Priority (member verbatim) and
---   resets delivery state: ReadAttempts=0, DirtyBit=0, retaining ReadDateTime.
---   NOOP when the member is not in the DLQ; EQDUP when it is already in the
---   source. Fail-before-write. All three keys must share one hash tag.
+--   resets delivery state: ReadAttempts=0, DirtyBit=0, VisibleAt=0 (immediately
+--   visible), retaining ReadDateTime. NOOP when the member is not in the DLQ;
+--   EQDUP when it is already in the source. Fail-before-write. All three keys
+--   must share one hash tag.
 -- ---------------------------------------------------------------------------
 local function msgfmt_redrive(keys, args)
   if #keys ~= 3 then
@@ -662,7 +705,9 @@ local function msgfmt_redrive(keys, args)
 
   redis.call('ZREM', dlq, member)
   redis.call('ZADD', queue, priority, member)
-  redis.call('HSET', mkey, 'ReadAttempts', '0', 'DirtyBit', '0') -- retain ReadDateTime
+  -- Reset delivery state so the redriven message is immediately deliverable;
+  -- VisibleAt=0 clears any not-before. ReadDateTime is retained.
+  redis.call('HSET', mkey, 'ReadAttempts', '0', 'DirtyBit', '0', 'VisibleAt', '0')
   return redis.status_reply('OK')
 end
 
