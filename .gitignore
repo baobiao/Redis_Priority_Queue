@@ -9,6 +9,12 @@ Thumbs.db
 .idea/
 
 # Test / harness scratch
-tests/.artifacts/
+test_bash/.artifacts/
 *.rdb
 dump.rdb
+
+# Feature 007: polyglot test suites
+test_java/target/
+test_python/.venv/
+__pycache__/
+.pytest_cache/
