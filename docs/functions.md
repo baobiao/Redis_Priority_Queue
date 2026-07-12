@@ -113,17 +113,28 @@ FCALL msgfmt_create 1 pq:{m1} Color red               -> MSGFMT EFIELD: Color
   - `KEYS[1]` = priority-queue **Sorted Set** (e.g. `pq:{q1}`).
   - `KEYS[2]` = message-key **prefix** (e.g. `pq:{q1}:m:`) — MUST carry the same hash tag as
     `KEYS[1]`. The message Hash for a given `id` is `KEYS[2] .. id`.
+  - `KEYS[3]` = dead-letter **Sorted Set** *(optional; e.g. `dlq:{q1}`)* — same hash tag as
+    `KEYS[1]`. Presence of `KEYS[3]` selects **dead-letter mode** (Feature 004).
   - `ARGV[1]` = `now` — non-negative integer epoch ms.
   - `ARGV[2]` = `timeout` — positive integer, the visibility timeout in ms.
   - `ARGV[3]` = `max_scan` *(optional)* — non-negative integer; `0`/absent = unbounded.
-- **Behaviour** (fail-before-write): validate keys/args and the shared hash tag; if `KEYS[1]`
-  is absent return null, if present but not a `zset` → `EMALFORMED`. Walk the front ascending
+  - `ARGV[4]` = `cap` *(required in dead-letter mode)* — positive integer maximum-delivery count.
+    Because arguments are positional, pass `max_scan` explicitly (e.g. `0`) before `cap`.
+- **Behaviour** (fail-before-write): with **2 keys** this is exactly Feature 003 (no dead-letter).
+  With **3 keys** (dead-letter mode) `cap` is required. Validate keys/args and the shared hash tag
+  (including `KEYS[3]`); if `KEYS[1]` is absent return null, if present but not a `zset` →
+  `EMALFORMED`; a present `KEYS[3]` that is not a `zset` → `EMALFORMED`. Walk the front ascending
   (`ZRANGE`, lowest score first, ties by member = FIFO). For each member derive `id` and read
   `mkey = KEYS[2] .. id`: a **dangling** member (Hash absent) is `ZREM`'d and skipped; a
   malformed candidate → `EMALFORMED`. A message is **available** when `DirtyBit=0`, or
-  `DirtyBit=1` with `now − ReadDateTime ≥ timeout` (an expired lease it reclaims). On the first
-  available message: `HINCRBY ReadAttempts 1`, `HSET DirtyBit 1 ReadDateTime now`, and return.
+  `DirtyBit=1` with `now − ReadDateTime ≥ timeout` (an expired lease it reclaims). For the first
+  available message: **in dead-letter mode, if `ReadAttempts ≥ cap`** it is moved to the DLQ
+  (`ZREM KEYS[1] member`, `ZADD KEYS[3] <Priority> member` — the Hash is untouched) and the scan
+  **continues**; otherwise it is leased — `HINCRBY ReadAttempts 1`, `HSET DirtyBit 1 ReadDateTime now`
+  — and returned.
 - **Score / lease**: the returned `ReadAttempts` is the **fencing token** for the settle call.
+  Dead-lettering is **silent** — the reply is the next deliverable handle or null, exactly as
+  Feature 003 (no count of dead-lettered messages is returned).
 - **Returns**: on a hit, a flat array (like `msgfmt_read`):
 
 ```
@@ -133,17 +144,20 @@ FCALL msgfmt_create 1 pq:{m1} Color red               -> MSGFMT EFIELD: Color
 
   When nothing is available (empty or all in-flight, within `max_scan`) it returns a **null**
   reply — distinct from a hit whose `Payload` is an empty string.
-- **Commands used**: `EXISTS`, `TYPE`, `ZRANGE`, `HMGET`, `HINCRBY`, `HSET`, `ZREM`.
+- **Commands used**: `EXISTS`, `TYPE`, `ZRANGE`, `HMGET`, `HINCRBY`, `HSET`, `ZREM`, `ZADD`.
 - **Errors**:
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `MSGFMT EKEYS: two or three keys required` | `#KEYS` ∉ {2, 3} |
   | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` missing / non-integer / `<0` / `>2^53` |
   | `MSGFMT ETMO: timeout must be a positive integer` | `ARGV[2]` missing / non-integer / `<1` / `>2^53` |
   | `MSGFMT ESCAN: max_scan must be a non-negative integer` | `ARGV[3]` present but invalid |
-  | `MSGFMT ETAG: queue and message-key prefix must share one hash tag` | tags differ / either lacks a tag |
+  | `MSGFMT ECAP: cap must be a positive integer` | dead-letter mode; `ARGV[4]` missing / non-integer / `<1` / `>2^53` |
+  | `MSGFMT ETAG: queue and message-key prefix must share one hash tag` | queue/prefix tags differ / either lacks a tag |
+  | `MSGFMT ETAG: dead-letter queue must share the queue hash tag` | `KEYS[3]` tag differs |
   | `MSGFMT EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
+  | `MSGFMT EMALFORMED: dead-letter queue is not a sorted set` | `KEYS[3]` exists, type ≠ `zset` |
   | `MSGFMT EMALFORMED: message <mkey> is not a hash` | an inspected candidate is not a hash |
   | `MSGFMT EMALFORMED: message <mkey> missing lease field` | a candidate lacks `DirtyBit`/`ReadDateTime`/`ReadAttempts` |
 
@@ -152,6 +166,11 @@ FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000
   -> ["id","2","member","00000000000000000002:2","ReadAttempts",1,
       "ReadDateTime",1000,"Priority",5,"Payload","high"]
 FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000   (empty/all-in-flight) -> (nil)
+
+# Dead-letter mode (cap=5): a front available message with ReadAttempts>=5 is moved
+# to dlq:{q1} and the next deliverable message is returned (or nil), silently.
+FCALL msgfmt_dequeue 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 0 5
+  -> ["id","8", ... ,"Payload","..."]
 ```
 
 ### `msgfmt_enqueue` — create a message and index it onto a priority queue
@@ -231,6 +250,52 @@ FCALL msgfmt_nack 1 pq:{q1}:m:2 1   -> OK    (DirtyBit->0; available again; Read
 FCALL msgfmt_nack 1 pq:{q1}:m:2 1   -> ENOTLEASED   (already released)
 ```
 
+### `msgfmt_peek` — inspect a queue without consuming
+
+- **Purpose**: look at a queue (a source queue or a DLQ) without leasing or mutating anything —
+  either the single next-deliverable message or the front N entries with their state.
+- **Write / callability**: **NO-WRITES** (registered with `flags = { 'no-writes' }`).
+  Callable via `FCALL_RO` (and `FCALL`).
+- **Inputs**:
+  - `KEYS[1]` = queue **Sorted Set** to inspect; `KEYS[2]` = message-key **prefix** (same tag).
+  - `ARGV[1]` = `now`; `ARGV[2]` = `timeout` (used by single mode for lease-awareness).
+  - `ARGV[3]` = `count` *(optional)* — positive integer. Absent or `1` → **single mode**; `N` → **top-N mode**.
+- **Behaviour** (no writes): validate keys/args and the shared tag; absent `KEYS[1]` → null
+  (single) / empty array (top-N); non-`zset` → `EMALFORMED`. **Single mode** walks the front and
+  returns the first **available** message (same rule as `msgfmt_dequeue`, lease-aware) as a record,
+  without mutating it; null if none. **Top-N mode** returns up to `count` front members in
+  priority-then-FIFO order **regardless of lease state**, each a record. Dangling members (Hash
+  absent) are **skipped and never removed** (read-only); a malformed Hash errors in single mode if
+  it is the selected candidate, and is skipped in top-N mode.
+- **Returns**: single mode — one **record** array, or null; top-N mode — an **array of records**
+  (`0 … count`). A record is:
+
+```
+["id", <id>, "member", <member>, "DirtyBit", <0|1>, "ReadAttempts", <int>,
+ "ReadDateTime", <int>, "Priority", <int>, "Payload", <bytes>]
+```
+
+- **Commands used**: `EXISTS`, `TYPE`, `ZRANGE`, `HMGET` (no writes).
+- **Errors**:
+
+  | Reply | Trigger |
+  |-------|---------|
+  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
+  | `MSGFMT ETMO: timeout must be a positive integer` | `ARGV[2]` invalid |
+  | `MSGFMT ECOUNT: count must be a positive integer` | `ARGV[3]` present but invalid |
+  | `MSGFMT ETAG: queue and message-key prefix must share one hash tag` | tags differ / missing |
+  | `MSGFMT EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
+  | `MSGFMT EMALFORMED: message <mkey> …` | single mode, the selected candidate's Hash is not a hash / missing a lease field |
+
+```
+FCALL_RO msgfmt_peek 2 pq:{q1} pq:{q1}:m: 1000 30000
+  -> ["id","5","member","00000000000000000005:5","DirtyBit",0,"ReadAttempts",0,
+      "ReadDateTime",0,"Priority",5,"Payload","high"]
+FCALL_RO msgfmt_peek 2 pq:{q1} pq:{q1}:m: 1000 30000 3   -> [[...],[...],[...]]   (up to 3)
+FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10  (inspect the DLQ)
+```
+
 ### `msgfmt_read` — read a message into a typed shape
 
 - **Purpose**: fetch a stored message and decode its fields to logical types.
@@ -266,6 +331,44 @@ FCALL msgfmt_nack 1 pq:{q1}:m:2 1   -> ENOTLEASED   (already released)
 FCALL_RO msgfmt_read 1 pq:{m1}   (after default create)
   -> ["ReadAttempts",0,"DirtyBit",0,"ReadDateTime",0,"Priority",1000,"Payload",""]
 FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
+```
+
+### `msgfmt_redrive` — move a message from the DLQ back to its source
+
+- **Purpose**: return one dead-lettered message to its source queue for reprocessing, resetting its
+  delivery state so it does not immediately dead-letter again.
+- **Write / callability**: **WRITE** (registered with no flags). Call via `FCALL`.
+- **Inputs** (all keys **literal** — the caller knows the id, so no construction):
+  - `KEYS[1]` = dead-letter **Sorted Set** (source of the move).
+  - `KEYS[2]` = source priority-queue **Sorted Set** (destination).
+  - `KEYS[3]` = the message **Hash** (e.g. `pq:{q1}:m:7`). All three share one hash tag.
+  - `ARGV[1]` = `member` — the exact DLQ member string to move (e.g. from a DLQ peek).
+- **Behaviour** (fail-before-write): validate `#KEYS == 3`, non-empty `member`, shared tag. Then:
+  `ZSCORE KEYS[1] member` nil → **`NOOP`** (not in the DLQ); `ZSCORE KEYS[2] member` non-nil →
+  **`EQDUP`** (already in the source); `KEYS[3]` absent / not a hash / missing `Priority` →
+  `EMALFORMED`. Otherwise, in one atomic call: `ZREM KEYS[1] member`, `ZADD KEYS[2] <Priority> member`
+  (score read from the Hash, member verbatim), `HSET KEYS[3] ReadAttempts 0 DirtyBit 0` — **`ReadDateTime`
+  is retained**.
+- **Returns**: `redis.status_reply("OK")` on a move; `redis.status_reply("NOOP")` when the member was
+  not in the DLQ.
+- **Commands used**: `ZSCORE`, `EXISTS`, `TYPE`, `HGET`, `ZREM`, `ZADD`, `HSET`.
+- **Errors**:
+
+  | Reply | Trigger |
+  |-------|---------|
+  | `MSGFMT EKEYS: exactly three keys required` | `#KEYS ≠ 3` |
+  | `MSGFMT EARGS: member required` | `ARGV[1]` missing/empty |
+  | `MSGFMT ETAG: keys must share one hash tag` | tags differ / missing |
+  | `MSGFMT EQDUP: already present in source queue` | `member` already in `KEYS[2]` |
+  | `MSGFMT EMALFORMED: message hash missing` | `KEYS[3]` absent (dangling DLQ member) |
+  | `MSGFMT EMALFORMED: key is not a hash` | `KEYS[3]` type ≠ hash |
+  | `MSGFMT EMALFORMED: missing field Priority` | `KEYS[3]` lacks `Priority` |
+
+```
+FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
+  -> OK    (member back in pq:{q1} at its Priority; hash reset RA=0/DB=0, ReadDateTime kept)
+FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
+  -> NOOP  (already redriven; no longer in the DLQ)
 ```
 
 ### `msgfmt_validate` — validate candidate field values without storing
