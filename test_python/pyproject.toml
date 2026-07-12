@@ -1,0 +1,8 @@
+[tool.pytest.ini_options]
+# Feature 007 — Python 3 parity suite for the priority_queue Redis Functions library.
+# Mirrors test_bash/* 1-to-1 via redis-py over TCP against the shared, port-published
+# engines (repo-root engines.env). No Testcontainers; run docker_engines.sh up + cluster-up first.
+testpaths = ["contract", "integration", "unit"]
+python_files = ["test_*.py"]
+pythonpath = ["."]
+addopts = "-ra -q"

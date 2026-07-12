@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example.pq</groupId>
+  <artifactId>priority-queue-tests</artifactId>
+  <version>0.0.7</version>
+  <packaging>jar</packaging>
+
+  <!--
+    Feature 007 — Java 25 parity suite for the `priority_queue` Redis Functions library.
+    Mirrors test_bash/* 1-to-1 via Jedis over TCP against the shared, port-published
+    engines (see repo-root engines.env). No Testcontainers (engine provisioning is the
+    shared Bash harness: `test_bash/harness/docker_engines.sh up` + `cluster-up`).
+  -->
+  <properties>
+    <maven.compiler.release>25</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <junit.version>5.13.1</junit.version>
+    <jedis.version>7.1.0</jedis.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>redis.clients</groupId>
+      <artifactId>jedis</artifactId>
+      <version>${jedis.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <!-- 3.14.0+ ships an ASM that understands JDK 25 class-file major v69 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.14.0</version>
+      </plugin>
+      <!-- 3.5.x Byte Buddy understands v69; auto-provisions the JUnit Platform -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>

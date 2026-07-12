@@ -1,11 +1,11 @@
-# `message_format` — Function Reference
+# `priority_queue` — Function Reference
 
-Developer reference for every function in `src/functions/message_format.lua`.
-The library loads with `FUNCTION LOAD` under the name **`message_format`** and runs
+Developer reference for every function in `src/functions/priority_queue.lua`.
+The library loads with `FUNCTION LOAD` under the name **`priority_queue`** and runs
 unmodified on Redis 7.0+, Valkey 7.2+, ElastiCache, and MemoryDB.
 
 A *message* is a single Hash with five fields. Keys are supplied via `KEYS[]`; the one
-sanctioned exception is `msgfmt_dequeue`, which appends the runtime message `id` to a
+sanctioned exception is `pq_dequeue`, which appends the runtime message `id` to a
 caller-supplied, co-located key prefix (`KEYS[2] .. id`) to reach a message it selects at
 runtime (constitution Principle IV, amended v2.0.0). Field/value pairs are supplied as a flat
 `name value name value ...` `ARGV` list (any subset — omitted fields take defaults).
@@ -29,9 +29,9 @@ VisibleAt` (`0` = immediately visible). It is distinct from the lease *visibilit
 reclaims an in-flight message).
 
 `DeadLetteredAt` (Feature 006) records **when** a message was dead-lettered (`0` = not dead-lettered);
-`msgfmt_dequeue` stamps it on the dead-letter move and `msgfmt_reap` ages the DLQ out by it.
+`pq_dequeue` stamps it on the dead-letter move and `pq_reap` ages the DLQ out by it.
 
-Both flow through the normal field path, so `msgfmt_create`/`msgfmt_enqueue` accept them with no
+Both flow through the normal field path, so `pq_create`/`pq_enqueue` accept them with no
 signature change; a **missing** `VisibleAt` (pre-005) or `DeadLetteredAt` (pre-006) is treated as `0`.
 
 ## Error convention
@@ -39,25 +39,25 @@ signature change; a **missing** `VisibleAt` (pre-005) or `DeadLetteredAt` (pre-0
 Two layers produce error text, and the prefix is applied in exactly one place:
 
 - **Registered (public) functions** return failures via
-  `redis.error_reply("MSGFMT <CODE>: <detail>")` and successes via
+  `redis.error_reply("PQ <CODE>: <detail>")` and successes via
   `redis.status_reply(...)`. Codes raised *directly* inside a public function
   (`EKEYS`, `EID`, `ESEQ`, `EEXISTS`, `EMALFORMED`, `EQDUP`, and the dequeue/settle codes
   `ENOW`, `ETMO`, `ESCAN`, `ETAG`, `ENOTLEASED`, `EFENCED`) are written with the full
-  `MSGFMT ` prefix inline.
+  `PQ ` prefix inline.
 - **Local helper functions** never call `redis.error_reply`. On failure they return
-  `(nil, "<CODE>: <detail>")` — a **bare** string with no `MSGFMT ` prefix. The calling
-  public function prepends it: `redis.error_reply('MSGFMT ' .. err)`. This is how
+  `(nil, "<CODE>: <detail>")` — a **bare** string with no `PQ ` prefix. The calling
+  public function prepends it: `redis.error_reply('PQ ' .. err)`. This is how
   `EARGS`, `EFIELD`, `EDUP`, and `EINVAL` reach the client.
 
-So an `EFIELD` seen by a client (`MSGFMT EFIELD: Color`) originated as the bare
-`"EFIELD: Color"` inside `parse_args`, and `msgfmt_create` / `msgfmt_enqueue` /
-`msgfmt_validate` added the `MSGFMT ` prefix.
+So an `EFIELD` seen by a client (`PQ EFIELD: Color`) originated as the bare
+`"EFIELD: Color"` inside `parse_args`, and `pq_create` / `pq_enqueue` /
+`pq_validate` added the `PQ ` prefix.
 
 ---
 
 ## Public functions (FCALL-able)
 
-### `msgfmt_ack` — acknowledge (delete) a processed message
+### `pq_ack` — acknowledge (delete) a processed message
 
 - **Purpose**: on successful processing, remove a leased message entirely — its queue member
   and its stored Hash — in one atomic call.
@@ -66,7 +66,7 @@ So an `EFIELD` seen by a client (`MSGFMT EFIELD: Color`) originated as the bare
 - **Inputs**: `KEYS[1]` = priority-queue **Sorted Set**; `KEYS[2]` = message **Hash**
   (`<prefix><id>`, known from the acquire handle). `ARGV[1]` = `member` (the full queue member
   from the handle, for `ZREM`); `ARGV[2]` = `token` (the fencing token — the `ReadAttempts`
-  value returned by `msgfmt_dequeue`).
+  value returned by `pq_dequeue`).
 - **Behaviour** (fail-before-write): if `KEYS[2]` is absent → idempotent `NOOP`; if it is not a
   hash or is missing lease fields → `EMALFORMED`; if `DirtyBit ≠ 1` → `ENOTLEASED`; if
   `ReadAttempts ≠ token` → `EFENCED`; otherwise `ZREM KEYS[1] member` then `DEL KEYS[2]`.
@@ -76,19 +76,19 @@ So an `EFIELD` seen by a client (`MSGFMT EFIELD: Color`) originated as the bare
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
-  | `MSGFMT EARGS: member and token required` | empty `member` or non-integer `token` |
-  | `MSGFMT EMALFORMED: key is not a hash` | `KEYS[2]` exists, type ≠ `hash` |
-  | `MSGFMT EMALFORMED: missing lease field` | `DirtyBit`/`ReadAttempts` absent |
-  | `MSGFMT ENOTLEASED: message not in-flight` | `DirtyBit = 0` |
-  | `MSGFMT EFENCED: lease superseded` | `ReadAttempts ≠ token` |
+  | `PQ EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `PQ EARGS: member and token required` | empty `member` or non-integer `token` |
+  | `PQ EMALFORMED: key is not a hash` | `KEYS[2]` exists, type ≠ `hash` |
+  | `PQ EMALFORMED: missing lease field` | `DirtyBit`/`ReadAttempts` absent |
+  | `PQ ENOTLEASED: message not in-flight` | `DirtyBit = 0` |
+  | `PQ EFENCED: lease superseded` | `ReadAttempts ≠ token` |
 
 ```
-FCALL msgfmt_ack 2 pq:{q1} pq:{q1}:m:2 00000000000000000002:2 1  -> OK
-FCALL msgfmt_ack 2 pq:{q1} pq:{q1}:m:2 00000000000000000002:2 1  -> NOOP   (idempotent retry)
+FCALL pq_ack 2 pq:{q1} pq:{q1}:m:2 00000000000000000002:2 1  -> OK
+FCALL pq_ack 2 pq:{q1} pq:{q1}:m:2 00000000000000000002:2 1  -> NOOP   (idempotent retry)
 ```
 
-### `msgfmt_create` — create & store a message
+### `pq_create` — create & store a message
 
 - **Purpose**: validate an optional set of field values, apply defaults for the rest,
   and store all five fields as one Hash.
@@ -103,20 +103,20 @@ FCALL msgfmt_ack 2 pq:{q1} pq:{q1}:m:2 00000000000000000002:2 1  -> NOOP   (idem
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: exactly one key required` | `#KEYS ≠ 1` |
-  | `MSGFMT EARGS: arguments must be name/value pairs` | odd `ARGV` count (from `parse_args`) |
-  | `MSGFMT EFIELD: <name>` | unrecognised field name |
-  | `MSGFMT EDUP: <name>` | field name supplied twice |
-  | `MSGFMT EINVAL: <field>` | value fails per-field validation |
+  | `PQ EKEYS: exactly one key required` | `#KEYS ≠ 1` |
+  | `PQ EARGS: arguments must be name/value pairs` | odd `ARGV` count (from `parse_args`) |
+  | `PQ EFIELD: <name>` | unrecognised field name |
+  | `PQ EDUP: <name>` | field name supplied twice |
+  | `PQ EINVAL: <field>` | value fails per-field validation |
 
 ```
-FCALL msgfmt_create 1 pq:{m1}                          -> OK   (all defaults)
-FCALL msgfmt_create 1 pq:{m1} Payload "hello" Priority 5 -> OK
-FCALL msgfmt_create 1 pq:{m1} ReadAttempts -1          -> MSGFMT EINVAL: ReadAttempts
-FCALL msgfmt_create 1 pq:{m1} Color red               -> MSGFMT EFIELD: Color
+FCALL pq_create 1 pq:{m1}                          -> OK   (all defaults)
+FCALL pq_create 1 pq:{m1} Payload "hello" Priority 5 -> OK
+FCALL pq_create 1 pq:{m1} ReadAttempts -1          -> PQ EINVAL: ReadAttempts
+FCALL pq_create 1 pq:{m1} Color red               -> PQ EFIELD: Color
 ```
 
-### `msgfmt_dequeue` — acquire (lease) the front available message
+### `pq_dequeue` — acquire (lease) the front available message
 
 - **Purpose**: select the highest-priority message that is not currently being processed,
   mark it in-flight, and return it for a consumer to work on.
@@ -151,7 +151,7 @@ FCALL msgfmt_create 1 pq:{m1} Color red               -> MSGFMT EFIELD: Color
 - **Score / lease**: the returned `ReadAttempts` is the **fencing token** for the settle call.
   Dead-lettering is **silent** — the reply is the next deliverable handle or null, exactly as
   Feature 003 (no count of dead-lettered messages is returned).
-- **Returns**: on a hit, a flat array (like `msgfmt_read`):
+- **Returns**: on a hit, a flat array (like `pq_read`):
 
 ```
 ["id", <id>, "member", <member>, "ReadAttempts", <int token>,
@@ -165,31 +165,31 @@ FCALL msgfmt_create 1 pq:{m1} Color red               -> MSGFMT EFIELD: Color
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: two or three keys required` | `#KEYS` ∉ {2, 3} |
-  | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` missing / non-integer / `<0` / `>2^53` |
-  | `MSGFMT ETMO: timeout must be a positive integer` | `ARGV[2]` missing / non-integer / `<1` / `>2^53` |
-  | `MSGFMT ESCAN: max_scan must be a non-negative integer` | `ARGV[3]` present but invalid |
-  | `MSGFMT ECAP: cap must be a positive integer` | dead-letter mode; `ARGV[4]` missing / non-integer / `<1` / `>2^53` |
-  | `MSGFMT ETAG: queue and message-key prefix must share one hash tag` | queue/prefix tags differ / either lacks a tag |
-  | `MSGFMT ETAG: dead-letter queue must share the queue hash tag` | `KEYS[3]` tag differs |
-  | `MSGFMT EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
-  | `MSGFMT EMALFORMED: dead-letter queue is not a sorted set` | `KEYS[3]` exists, type ≠ `zset` |
-  | `MSGFMT EMALFORMED: message <mkey> is not a hash` | an inspected candidate is not a hash |
-  | `MSGFMT EMALFORMED: message <mkey> missing lease field` | a candidate lacks `DirtyBit`/`ReadDateTime`/`ReadAttempts` |
+  | `PQ EKEYS: two or three keys required` | `#KEYS` ∉ {2, 3} |
+  | `PQ ENOW: now must be a non-negative integer` | `ARGV[1]` missing / non-integer / `<0` / `>2^53` |
+  | `PQ ETMO: timeout must be a positive integer` | `ARGV[2]` missing / non-integer / `<1` / `>2^53` |
+  | `PQ ESCAN: max_scan must be a non-negative integer` | `ARGV[3]` present but invalid |
+  | `PQ ECAP: cap must be a positive integer` | dead-letter mode; `ARGV[4]` missing / non-integer / `<1` / `>2^53` |
+  | `PQ ETAG: queue and message-key prefix must share one hash tag` | queue/prefix tags differ / either lacks a tag |
+  | `PQ ETAG: dead-letter queue must share the queue hash tag` | `KEYS[3]` tag differs |
+  | `PQ EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
+  | `PQ EMALFORMED: dead-letter queue is not a sorted set` | `KEYS[3]` exists, type ≠ `zset` |
+  | `PQ EMALFORMED: message <mkey> is not a hash` | an inspected candidate is not a hash |
+  | `PQ EMALFORMED: message <mkey> missing lease field` | a candidate lacks `DirtyBit`/`ReadDateTime`/`ReadAttempts` |
 
 ```
-FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000
+FCALL pq_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000
   -> ["id","2","member","00000000000000000002:2","ReadAttempts",1,
       "ReadDateTime",1000,"Priority",5,"Payload","high"]
-FCALL msgfmt_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000   (empty/all-in-flight) -> (nil)
+FCALL pq_dequeue 2 pq:{q1} pq:{q1}:m: 1000 30000   (empty/all-in-flight) -> (nil)
 
 # Dead-letter mode (cap=5): a front available message with ReadAttempts>=5 is moved
 # to dlq:{q1} and the next deliverable message is returned (or nil), silently.
-FCALL msgfmt_dequeue 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 0 5
+FCALL pq_dequeue 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 0 5
   -> ["id","8", ... ,"Payload","..."]
 ```
 
-### `msgfmt_enqueue` — create a message and index it onto a priority queue
+### `pq_enqueue` — create a message and index it onto a priority queue
 
 - **Purpose**: atomically store a message Hash and add one member to a priority-queue
   Sorted Set, scored by the message's `Priority`.
@@ -200,7 +200,7 @@ FCALL msgfmt_dequeue 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 0 5
     cluster slot via a shared hash tag (e.g. `pq:{q1}` and `pq:{q1}:m:42`).
   - `ARGV[1]` = `id` — non-empty message identifier.
   - `ARGV[2]` = `sequence` — non-negative integer `0 … 2^53`; breaks priority ties (FIFO).
-  - `ARGV[3..]` = optional `field value` pairs (same set/defaults as `msgfmt_create`).
+  - `ARGV[3..]` = optional `field value` pairs (same set/defaults as `pq_create`).
 - **Behaviour** (fail-before-write — nothing is written unless every check passes):
   1. Require exactly two keys.
   2. Reject empty/missing `id`; reject non-integer / negative / `> 2^53` `sequence`.
@@ -218,26 +218,26 @@ FCALL msgfmt_dequeue 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 0 5
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
-  | `MSGFMT EID: id must be a non-empty string` | `ARGV[1]` missing or empty |
-  | `MSGFMT ESEQ: sequence must be a non-negative integer` | `ARGV[2]` missing / non-integer / `< 0` / `> 2^53` |
-  | `MSGFMT EARGS: arguments must be name/value pairs` | odd field/value count (reused) |
-  | `MSGFMT EFIELD: <name>` | unknown field name (reused) |
-  | `MSGFMT EDUP: <name>` | duplicate field name (reused) |
-  | `MSGFMT EINVAL: <field>` | invalid field value (reused) |
-  | `MSGFMT EEXISTS: message location occupied` | `KEYS[2]` already exists |
-  | `MSGFMT EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists with a non-`zset` type |
-  | `MSGFMT EQDUP: already enqueued` | member already present in `KEYS[1]` |
+  | `PQ EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `PQ EID: id must be a non-empty string` | `ARGV[1]` missing or empty |
+  | `PQ ESEQ: sequence must be a non-negative integer` | `ARGV[2]` missing / non-integer / `< 0` / `> 2^53` |
+  | `PQ EARGS: arguments must be name/value pairs` | odd field/value count (reused) |
+  | `PQ EFIELD: <name>` | unknown field name (reused) |
+  | `PQ EDUP: <name>` | duplicate field name (reused) |
+  | `PQ EINVAL: <field>` | invalid field value (reused) |
+  | `PQ EEXISTS: message location occupied` | `KEYS[2]` already exists |
+  | `PQ EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists with a non-`zset` type |
+  | `PQ EQDUP: already enqueued` | member already present in `KEYS[1]` |
 
 ```
-FCALL msgfmt_enqueue 2 pq:{q1} pq:{q1}:m:42 42 1 Payload "order-42" Priority 5
+FCALL pq_enqueue 2 pq:{q1} pq:{q1}:m:42 42 1 Payload "order-42" Priority 5
   -> OK   (stores Hash at pq:{q1}:m:42; adds member "00000000000000000001:42" scored 5)
-re-run same call        -> MSGFMT EEXISTS: message location occupied
-... pq:{q1}:m:9 9 -1     -> MSGFMT ESEQ: sequence must be a non-negative integer
-... pq:{q1}:m:9 9 2 Priority foo -> MSGFMT EINVAL: Priority   (nothing written)
+re-run same call        -> PQ EEXISTS: message location occupied
+... pq:{q1}:m:9 9 -1     -> PQ ESEQ: sequence must be a non-negative integer
+... pq:{q1}:m:9 9 2 Priority foo -> PQ EINVAL: Priority   (nothing written)
 ```
 
-### `msgfmt_nack` — release a lease for redelivery
+### `pq_nack` — release a lease for redelivery
 
 - **Purpose**: on failed processing, release a leased message so it becomes available again at
   its original position, preserving the record that it was read.
@@ -258,22 +258,22 @@ re-run same call        -> MSGFMT EEXISTS: message location occupied
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: exactly one key required` | `#KEYS ≠ 1` |
-  | `MSGFMT EARGS: token required` | non-integer `token` |
-  | `MSGFMT EVIS: visibleAt must be a non-negative integer` | `ARGV[2]` present and non-integer / `< 0` / `> 2^53` |
-  | `MSGFMT EMALFORMED: key is not a hash` | `KEYS[1]` exists, type ≠ `hash` |
-  | `MSGFMT EMALFORMED: missing lease field` | `DirtyBit`/`ReadAttempts` absent |
-  | `MSGFMT ENOTLEASED: message not in-flight` | `DirtyBit = 0` |
-  | `MSGFMT EFENCED: lease superseded` | `ReadAttempts ≠ token` |
+  | `PQ EKEYS: exactly one key required` | `#KEYS ≠ 1` |
+  | `PQ EARGS: token required` | non-integer `token` |
+  | `PQ EVIS: visibleAt must be a non-negative integer` | `ARGV[2]` present and non-integer / `< 0` / `> 2^53` |
+  | `PQ EMALFORMED: key is not a hash` | `KEYS[1]` exists, type ≠ `hash` |
+  | `PQ EMALFORMED: missing lease field` | `DirtyBit`/`ReadAttempts` absent |
+  | `PQ ENOTLEASED: message not in-flight` | `DirtyBit = 0` |
+  | `PQ EFENCED: lease superseded` | `ReadAttempts ≠ token` |
 
 ```
-FCALL msgfmt_nack 1 pq:{q1}:m:2 1        -> OK    (DirtyBit->0; available now; ReadAttempts kept)
-FCALL msgfmt_nack 1 pq:{q1}:m:2 1 90000  -> OK    (retry backoff: hidden until now >= 90000)
-FCALL msgfmt_nack 1 pq:{q1}:m:2 1 -5     -> MSGFMT EVIS: visibleAt must be a non-negative integer
-FCALL msgfmt_nack 1 pq:{q1}:m:2 1        -> ENOTLEASED   (already released)
+FCALL pq_nack 1 pq:{q1}:m:2 1        -> OK    (DirtyBit->0; available now; ReadAttempts kept)
+FCALL pq_nack 1 pq:{q1}:m:2 1 90000  -> OK    (retry backoff: hidden until now >= 90000)
+FCALL pq_nack 1 pq:{q1}:m:2 1 -5     -> PQ EVIS: visibleAt must be a non-negative integer
+FCALL pq_nack 1 pq:{q1}:m:2 1        -> ENOTLEASED   (already released)
 ```
 
-### `msgfmt_peek` — inspect a queue without consuming
+### `pq_peek` — inspect a queue without consuming
 
 - **Purpose**: look at a queue (a source queue or a DLQ) without leasing or mutating anything —
   either the single next-deliverable message or the front N entries with their state.
@@ -285,7 +285,7 @@ FCALL msgfmt_nack 1 pq:{q1}:m:2 1        -> ENOTLEASED   (already released)
   - `ARGV[3]` = `count` *(optional)* — positive integer. Absent or `1` → **single mode**; `N` → **top-N mode**.
 - **Behaviour** (no writes): validate keys/args and the shared tag; absent `KEYS[1]` → null
   (single) / empty array (top-N); non-`zset` → `EMALFORMED`. **Single mode** walks the front and
-  returns the first **deliverable** message — the same rule as `msgfmt_dequeue`: lease-available
+  returns the first **deliverable** message — the same rule as `pq_dequeue`: lease-available
   **and** `now ≥ VisibleAt` (not-yet-visible messages are skipped) — as a record, without mutating
   it; null if none. **Top-N mode** returns up to `count` front members in priority-then-FIFO order
   **regardless of lease/visibility state** (so not-yet-visible members are reported), each a record.
@@ -304,23 +304,23 @@ FCALL msgfmt_nack 1 pq:{q1}:m:2 1        -> ENOTLEASED   (already released)
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
-  | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
-  | `MSGFMT ETMO: timeout must be a positive integer` | `ARGV[2]` invalid |
-  | `MSGFMT ECOUNT: count must be a positive integer` | `ARGV[3]` present but invalid |
-  | `MSGFMT ETAG: queue and message-key prefix must share one hash tag` | tags differ / missing |
-  | `MSGFMT EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
-  | `MSGFMT EMALFORMED: message <mkey> …` | single mode, the selected candidate's Hash is not a hash / missing a lease field |
+  | `PQ EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `PQ ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
+  | `PQ ETMO: timeout must be a positive integer` | `ARGV[2]` invalid |
+  | `PQ ECOUNT: count must be a positive integer` | `ARGV[3]` present but invalid |
+  | `PQ ETAG: queue and message-key prefix must share one hash tag` | tags differ / missing |
+  | `PQ EMALFORMED: queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
+  | `PQ EMALFORMED: message <mkey> …` | single mode, the selected candidate's Hash is not a hash / missing a lease field |
 
 ```
-FCALL_RO msgfmt_peek 2 pq:{q1} pq:{q1}:m: 1000 30000
+FCALL_RO pq_peek 2 pq:{q1} pq:{q1}:m: 1000 30000
   -> ["id","5","member","00000000000000000005:5","DirtyBit",0,"ReadAttempts",0,
       "ReadDateTime",0,"Priority",5,"Payload","high"]
-FCALL_RO msgfmt_peek 2 pq:{q1} pq:{q1}:m: 1000 30000 3   -> [[...],[...],[...]]   (up to 3)
-FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10  (inspect the DLQ)
+FCALL_RO pq_peek 2 pq:{q1} pq:{q1}:m: 1000 30000 3   -> [[...],[...],[...]]   (up to 3)
+FCALL_RO pq_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10  (inspect the DLQ)
 ```
 
-### `msgfmt_read` — read a message into a typed shape
+### `pq_read` — read a message into a typed shape
 
 - **Purpose**: fetch a stored message and decode its fields to logical types.
 - **Write / callability**: **NO-WRITES** (registered with `flags = { 'no-writes' }`).
@@ -351,17 +351,17 @@ FCALL_RO msgfmt_peek 2 dlq:{q1} pq:{q1}:m: 1000 30000 10  (inspect the DLQ)
   | Reply | Kind | Trigger |
   |-------|------|---------|
   | `NOTFOUND` | status | key does not exist |
-  | `MSGFMT EKEYS: exactly one key required` | error | `#KEYS ≠ 1` |
-  | `MSGFMT EMALFORMED: key is not a hash` | error | key exists but `TYPE ≠ hash` |
-  | `MSGFMT EMALFORMED: missing field <Field>` | error | one of the five **original** fields is absent (`HMGET` returned `false`); a missing `VisibleAt` is NOT an error |
+  | `PQ EKEYS: exactly one key required` | error | `#KEYS ≠ 1` |
+  | `PQ EMALFORMED: key is not a hash` | error | key exists but `TYPE ≠ hash` |
+  | `PQ EMALFORMED: missing field <Field>` | error | one of the five **original** fields is absent (`HMGET` returned `false`); a missing `VisibleAt` is NOT an error |
 
 ```
-FCALL_RO msgfmt_read 1 pq:{m1}   (after default create)
+FCALL_RO pq_read 1 pq:{m1}   (after default create)
   -> ["ReadAttempts",0,"DirtyBit",0,"ReadDateTime",0,"Priority",1000,"Payload","","VisibleAt",0,"DeadLetteredAt",0]
-FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
+FCALL_RO pq_read 1 pq:{absent}  -> NOTFOUND
 ```
 
-### `msgfmt_reap` — age out old dead-lettered messages
+### `pq_reap` — age out old dead-lettered messages
 
 - **Purpose**: permanently remove dead-lettered messages older than a caller-supplied retention window,
   bounded per call, so the dead-letter queue does not grow without bound.
@@ -379,26 +379,26 @@ FCALL_RO msgfmt_read 1 pq:{absent}  -> NOTFOUND
   when `ZCARD > limit`.
 - **Priority-order caveat**: reap walks the DLQ front *in Priority order*, so a small `limit` may miss
   expired low-priority entries behind unexpired high-priority ones; size `limit` to the DLQ depth (from
-  `msgfmt_stats`) or page to fully drain.
+  `pq_stats`) or page to fully drain.
 - **Returns**: a flat map `["removed", <int>, "scanned", <int>, "truncated", <0|1>]`.
 - **Commands used**: `EXISTS`, `TYPE`, `ZRANGE`, `HGET`, `ZREM`, `DEL`, `ZCARD`.
 - **Errors**:
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
-  | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
-  | `MSGFMT ERET: retention must be a non-negative integer` | `ARGV[2]` invalid |
-  | `MSGFMT ELIMIT: limit must be a positive integer` | `ARGV[3]` invalid |
-  | `MSGFMT ETAG: dead-letter queue and message-key prefix must share one hash tag` | tags differ / missing |
-  | `MSGFMT EMALFORMED: dead-letter queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
+  | `PQ EKEYS: exactly two keys required` | `#KEYS ≠ 2` |
+  | `PQ ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
+  | `PQ ERET: retention must be a non-negative integer` | `ARGV[2]` invalid |
+  | `PQ ELIMIT: limit must be a positive integer` | `ARGV[3]` invalid |
+  | `PQ ETAG: dead-letter queue and message-key prefix must share one hash tag` | tags differ / missing |
+  | `PQ EMALFORMED: dead-letter queue is not a sorted set` | `KEYS[1]` exists, type ≠ `zset` |
 
 ```
-FCALL msgfmt_reap 2 dlq:{q1} pq:{q1}:m: 140000 30000 500
+FCALL pq_reap 2 dlq:{q1} pq:{q1}:m: 140000 30000 500
   -> ["removed",7,"scanned",500,"truncated",1]   (7 expired/dangling removed; DLQ still has >500)
 ```
 
-### `msgfmt_redrive` — move a message from the DLQ back to its source
+### `pq_redrive` — move a message from the DLQ back to its source
 
 - **Purpose**: return one dead-lettered message to its source queue for reprocessing, resetting its
   delivery state so it does not immediately dead-letter again.
@@ -423,25 +423,25 @@ FCALL msgfmt_reap 2 dlq:{q1} pq:{q1}:m: 140000 30000 500
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: exactly three keys required` | `#KEYS ≠ 3` |
-  | `MSGFMT EARGS: member required` | `ARGV[1]` missing/empty |
-  | `MSGFMT ETAG: keys must share one hash tag` | tags differ / missing |
-  | `MSGFMT EQDUP: already present in source queue` | `member` already in `KEYS[2]` |
-  | `MSGFMT EMALFORMED: message hash missing` | `KEYS[3]` absent (dangling DLQ member) |
-  | `MSGFMT EMALFORMED: key is not a hash` | `KEYS[3]` type ≠ hash |
-  | `MSGFMT EMALFORMED: missing field Priority` | `KEYS[3]` lacks `Priority` |
+  | `PQ EKEYS: exactly three keys required` | `#KEYS ≠ 3` |
+  | `PQ EARGS: member required` | `ARGV[1]` missing/empty |
+  | `PQ ETAG: keys must share one hash tag` | tags differ / missing |
+  | `PQ EQDUP: already present in source queue` | `member` already in `KEYS[2]` |
+  | `PQ EMALFORMED: message hash missing` | `KEYS[3]` absent (dangling DLQ member) |
+  | `PQ EMALFORMED: key is not a hash` | `KEYS[3]` type ≠ hash |
+  | `PQ EMALFORMED: missing field Priority` | `KEYS[3]` lacks `Priority` |
 
 ```
-FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
+FCALL pq_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
   -> OK    (member back in pq:{q1} at its Priority; hash reset RA=0/DB=0/VisibleAt=0/DeadLetteredAt=0, ReadDateTime kept)
-FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
+FCALL pq_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
   -> NOOP  (already redriven; no longer in the DLQ)
 ```
 
-### `msgfmt_stats` — aggregate queue state (read-only observability)
+### `pq_stats` — aggregate queue state (read-only observability)
 
 - **Purpose**: report aggregate queue state without consuming — depths, front Priority, and an optional
-  bounded breakdown by message state — beyond `msgfmt_peek`'s head view.
+  bounded breakdown by message state — beyond `pq_peek`'s head view.
 - **Write / callability**: **NO-WRITES** (registered with `flags = { 'no-writes' }`). Callable via
   `FCALL_RO` (and `FCALL`).
 - **Inputs**:
@@ -471,42 +471,42 @@ FCALL msgfmt_redrive 3 dlq:{q1} pq:{q1} pq:{q1}:m:7 00000000000000000007:7
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EKEYS: two or three keys required` | `#KEYS` ∉ {2,3} |
-  | `MSGFMT ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
-  | `MSGFMT ETMO: timeout must be a positive integer` | `ARGV[2]` invalid |
-  | `MSGFMT ESCAN: max_scan must be a non-negative integer` | `ARGV[3]` present but invalid |
-  | `MSGFMT ETAG: keys must share one hash tag` | tags differ / missing |
-  | `MSGFMT EMALFORMED: queue is not a sorted set` / `... dead-letter queue is not a sorted set` | `KEYS[1]`/`KEYS[3]` exists, type ≠ `zset` |
+  | `PQ EKEYS: two or three keys required` | `#KEYS` ∉ {2,3} |
+  | `PQ ENOW: now must be a non-negative integer` | `ARGV[1]` invalid |
+  | `PQ ETMO: timeout must be a positive integer` | `ARGV[2]` invalid |
+  | `PQ ESCAN: max_scan must be a non-negative integer` | `ARGV[3]` present but invalid |
+  | `PQ ETAG: keys must share one hash tag` | tags differ / missing |
+  | `PQ EMALFORMED: queue is not a sorted set` / `... dead-letter queue is not a sorted set` | `KEYS[1]`/`KEYS[3]` exists, type ≠ `zset` |
 
 ```
-FCALL_RO msgfmt_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000
+FCALL_RO pq_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000
   -> ["depth",42,"dlq_depth",3,"front_priority",5]                         (cheap tier)
-FCALL_RO msgfmt_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 100
+FCALL_RO pq_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 100
   -> ["depth",42,"dlq_depth",3,"front_priority",5,"scanned",42,"truncated",0,
       "available",30,"in_flight",8,"delayed",4,"skipped",0,
       "dlq_scanned",3,"oldest_dead_letter_age",900,"age_truncated",0]
 ```
 
-### `msgfmt_validate` — validate candidate field values without storing
+### `pq_validate` — validate candidate field values without storing
 
 - **Purpose**: run the exact create-time validation over supplied field values and report
   the outcome, storing nothing (dry-run / reusable validation routine).
 - **Write / callability**: **NO-WRITES** (registered with `flags = { 'no-writes' }`).
   Callable via `FCALL_RO` (and `FCALL`).
 - **Inputs**: **no `KEYS`** — any keys passed are ignored and no key is accessed. `ARGV` =
-  `field value` pairs (same format as `msgfmt_create`).
+  `field value` pairs (same format as `pq_create`).
 - **Behaviour**: calls `build_message(ARGV)` and discards the result; only the error is
   inspected. No Redis command runs.
 - **Returns**: `redis.status_reply("VALID")` when every supplied value validates and every
   field name is recognised.
-- **Errors** (identical to `msgfmt_create`'s validation errors):
+- **Errors** (identical to `pq_create`'s validation errors):
 
   | Reply | Trigger |
   |-------|---------|
-  | `MSGFMT EARGS: arguments must be name/value pairs` | odd `ARGV` count |
-  | `MSGFMT EFIELD: <name>` | unrecognised field name |
-  | `MSGFMT EDUP: <name>` | duplicate field name |
-  | `MSGFMT EINVAL: <field>` | value fails per-field validation |
+  | `PQ EARGS: arguments must be name/value pairs` | odd `ARGV` count |
+  | `PQ EFIELD: <name>` | unrecognised field name |
+  | `PQ EDUP: <name>` | duplicate field name |
+  | `PQ EINVAL: <field>` | value fails per-field validation |
 
 ---
 
@@ -514,13 +514,13 @@ FCALL_RO msgfmt_stats 3 pq:{q1} pq:{q1}:m: dlq:{q1} 1000 30000 100
 
 These are file-local Lua functions (not registered, not client-callable). They return
 Lua values, not `redis.error_reply` objects; on failure they yield `(nil, "<CODE>: <detail>")`
-with no `MSGFMT ` prefix (the calling public function adds it).
+with no `PQ ` prefix (the calling public function adds it).
 
 ### `build_message(args)` — encode a full field list with defaults
 
 - **Purpose**: turn a flat `name value ...` list into the complete encoded HSET argument
-  list, filling defaults for omitted fields. Shared by `msgfmt_create`, `msgfmt_enqueue`,
-  and `msgfmt_validate`.
+  list, filling defaults for omitted fields. Shared by `pq_create`, `pq_enqueue`,
+  and `pq_validate`.
 - **Parameters**: `args` — the flat `name value ...` list (`ARGV`, or `ARGV[3..]` for
   enqueue).
 - **Behaviour**: calls `parse_args(args)`; for each of the seven fields in canonical order,
@@ -555,7 +555,7 @@ with no `MSGFMT ` prefix (the calling public function adds it).
 - **Behaviour / returns**: returns the boolean
   `n ~= nil and n == n and n ~= math.huge and n ~= -math.huge and math.floor(n) == n` —
   i.e. `true` iff `n` is a non-nil, non-NaN, finite number equal to its own floor. No error
-  string; pure predicate. Used by `encode_field` (numeric fields) and `msgfmt_enqueue`
+  string; pure predicate. Used by `encode_field` (numeric fields) and `pq_enqueue`
   (`sequence`).
 
 ### `parse_args(args)` — parse the flat pair list into a map
