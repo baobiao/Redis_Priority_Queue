@@ -29,7 +29,7 @@ when `tonumber(value)` returns a finite number `n` (not `nil`, not `NaN`, not `�
 
 One message is stored as a single **Hash** at a **caller-supplied key**
 (`KEYS[1]` for `msgfmt_create`/`msgfmt_read`; `KEYS[2]` for `msgfmt_enqueue`). One Hash =
-one message. The field set is **closed**: exactly these five fields, one Hash field each.
+one message. The field set is **closed**: exactly these six fields, one Hash field each.
 Supplying any other field name, a duplicate name, or an odd `name value` count is rejected
 and nothing is stored (fail-before-write).
 
@@ -40,6 +40,7 @@ and nothing is stored (fail-before-write).
 | `ReadDateTime` | Integer ≥ 0 (Unix epoch ms) | `0` | decimal string via `%.0f`, e.g. `"0"` | integer, `0 ≤ n ≤ 2^53` |
 | `Priority` | Integer | `1000` | decimal string via `%.0f`, e.g. `"1000"` | integer, `\|n\| ≤ 2^53` (`-2^53 ≤ n ≤ 2^53`) |
 | `Payload` | String | `""` | raw byte string, stored as-is | any byte string (always valid, incl. empty) |
+| `VisibleAt` | Integer ≥ 0 (Unix epoch ms) | `0` | decimal string via `%.0f`, e.g. `"0"` | integer, `0 ≤ n ≤ 2^53` |
 
 Semantics:
 
@@ -48,14 +49,21 @@ Semantics:
   before comparison; anything outside the four-token set is `EINVAL: DirtyBit`.
 - **`Priority`: lower value = higher priority.** `Priority` is signed (unlike the two
   non-negative counters); default `1000`.
-- Omitted fields take their default; the message is always written with **all five** fields.
+- **`VisibleAt` `0` = immediately visible** (no not-before). See §4a — it is the delayed-visibility
+  gate, distinct from the lease visibility timeout.
+- Omitted fields take their default; the message is always written with **all six** fields.
+- **Back-compat**: `VisibleAt` was added in Feature 005. A message stored by Features 001–004 has
+  only the first five fields; readers treat a **missing `VisibleAt` as `0`** (immediately visible)
+  and never error on its absence, so no migration is needed. The five original fields remain
+  strictly required.
 
 ### Read decoding (round-trip)
 
 `msgfmt_read` returns a flat `name value name value ...` array with each field decoded back to
 its logical type:
 
-- `ReadAttempts`, `ReadDateTime`, `Priority` → numbers (`tonumber`);
+- `ReadAttempts`, `ReadDateTime`, `Priority`, `VisibleAt` → numbers (`tonumber`); a missing
+  `VisibleAt` (a pre-Feature-005 message) decodes to `0`;
 - `Payload` → the raw stored string;
 - `DirtyBit` → **integer `0` or `1`, not a boolean**. RESP2 has no boolean type, and returning
   a Lua `false` would marshal to a nil/absent reply; the integer avoids that `false`→nil
@@ -139,6 +147,31 @@ with `LEASED → (timeout) reclaimable`. `ReadAttempts` records how many times a
 delivered; when a dead-letter queue and a delivery cap are supplied (Feature 004, §4), an
 available message whose `ReadAttempts` has reached the cap is moved to the dead-letter queue on
 its next dequeue instead of being delivered again.
+
+### 3a. Delayed visibility (not-before) — DISTINCT from the lease timeout
+
+`VisibleAt` (Feature 005) is a **not-before time**: an otherwise-available message
+(`DirtyBit=0`) is **not deliverable until `now ≥ VisibleAt`**. This is a **different concept** from
+the lease "visibility timeout" above — do not conflate them:
+
+| | Lease visibility timeout (Feature 003) | Delayed visibility / `VisibleAt` (Feature 005) |
+|---|---|---|
+| Governs | an **in-flight** message (`DirtyBit=1`) | an **available** message (`DirtyBit=0`) |
+| Effect | reclaim the lease after `now − ReadDateTime ≥ timeout` | hold the message back until `now ≥ VisibleAt` |
+| Set by | acquire stamps `ReadDateTime`; caller supplies `timeout` per dequeue | caller supplies `VisibleAt` (enqueue field, or nack backoff) |
+
+**Deliverability**: `msgfmt_dequeue` (and `msgfmt_peek` single mode) select a message only when it is
+lease-available **and** `now ≥ VisibleAt`. A not-yet-visible message is present in the queue but
+skipped in the front scan (it counts against `max_scan`), exactly like an unexpired lease; it never
+changes priority ordering (`VisibleAt` is in the Hash, never in a score). Two ways to set it:
+
+- **Scheduled delivery**: enqueue with `VisibleAt <epoch>` (a normal field) → deliverable only later.
+- **Retry backoff**: `msgfmt_nack <token> <VisibleAt>` releases the lease **and** hides the message
+  until `now ≥ VisibleAt` (retaining `ReadDateTime`/`ReadAttempts`).
+
+`msgfmt_redrive` resets `VisibleAt` to `0` (immediately visible). A not-yet-visible over-cap message
+is **not** dead-lettered until it becomes visible (dead-lettering is a delivery-time action, gated by
+deliverability). Times are caller-supplied (deterministic; no server clock).
 
 ## 4. The Dead-Letter Queue (DLQ) — poison-message handling
 
