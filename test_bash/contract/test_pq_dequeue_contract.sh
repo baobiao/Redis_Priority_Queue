@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== dequeue contract on: $e =="
-  load_library "$e"
   engine_cli "$e" DEL "pq:{c1}" "pq:{c1}:m:x" >/dev/null
 
   # Empty queue -> null reply (empty output).
@@ -61,6 +58,6 @@ for e in $ENGINES; do
   out=$(fcall "$e" pq_dequeue 3 "pq:{c1}" "pq:{c1}:m:" "dlq:{c1}" 1000 30000 0 5 2>&1 || true)
   expect_contains "non-zset DLQ -> EMALFORMED" "EMALFORMED" "$out"
   engine_cli "$e" DEL "dlq:{c1}" >/dev/null
-done
+}
 
-finish
+run_suite suite

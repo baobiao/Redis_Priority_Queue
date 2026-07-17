@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== nack VisibleAt validation on: $e =="
-  load_library "$e"
 
   q="pq:{nv}"; pfx="pq:{nv}:m:"
   engine_cli "$e" DEL "$q" "${pfx}1" >/dev/null
@@ -32,6 +29,6 @@ for e in $ENGINES; do
   expect "valid nack-with-delay returns OK" "OK" "$out"
   expect "DirtyBit cleared to 0" "0" "$(engine_cli "$e" HGET "${pfx}1" DirtyBit)"
   expect "VisibleAt applied (7000)" "7000" "$(engine_cli "$e" HGET "${pfx}1" VisibleAt)"
-done
+}
 
-finish
+run_suite suite

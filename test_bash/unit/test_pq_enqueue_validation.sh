@@ -4,12 +4,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== enqueue validation on: $e =="
-  load_library "$e"
   engine_cli "$e" DEL "pq:{u1}" "pq:{u1}:m:x" >/dev/null
 
   out=$(fcall "$e" pq_enqueue 2 "pq:{u1}" "pq:{u1}:m:x" "" 1 2>&1 || true)
@@ -39,6 +36,6 @@ for e in $ENGINES; do
   # Nothing written to either structure after any failure.
   expect "no message hash stored" "0" "$(engine_cli "$e" EXISTS "pq:{u1}:m:x")"
   expect "queue index not created" "0" "$(engine_cli "$e" EXISTS "pq:{u1}")"
-done
+}
 
-finish
+run_suite suite

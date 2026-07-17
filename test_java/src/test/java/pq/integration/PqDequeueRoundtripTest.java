@@ -27,8 +27,7 @@ class PqDequeueRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void dequeueAckNackRoundTrip(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{d1}";
       String pfx = "pq:{d1}:m:";
       j.del(q, pfx + "a", pfx + "b", pfx + "c");

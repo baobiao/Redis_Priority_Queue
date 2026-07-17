@@ -4,12 +4,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== pq_create contract on: $e =="
-  load_library "$e"
   engine_cli "$e" DEL "q:{c1}" >/dev/null
 
   out=$(fcall "$e" pq_create 1 "q:{c1}")
@@ -26,6 +23,6 @@ for e in $ENGINES; do
 
   out=$(fcall "$e" pq_create 1 "q:{c1}" Priority 1 Priority 2 2>&1 || true)
   expect_contains "duplicate field -> EDUP" "EDUP" "$out"
-done
+}
 
-finish
+run_suite suite

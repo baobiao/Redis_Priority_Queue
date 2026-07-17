@@ -16,12 +16,9 @@ expect_absent() { # <label> <needle> <haystack>
   esac
 }
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== peek on: $e =="
-  load_library "$e"
 
   q="pq:{pk}"; pfx="pq:{pk}:m:"
   engine_cli "$e" DEL "$q" "${pfx}A" "${pfx}B" "${pfx}C" >/dev/null
@@ -86,6 +83,6 @@ for e in $ENGINES; do
   fcall "$e" pq_enqueue 2 "$dl" "${dlpfx}W" W 1 Priority 9 Payload PAY-W >/dev/null
   out=$(fcall_ro "$e" pq_peek 2 "$dl" "$dlpfx" 1000 30000)
   expect_contains "peek inspects a DLQ-shaped queue" "PAY-W" "$out"
-done
+}
 
-finish
+run_suite suite

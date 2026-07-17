@@ -25,8 +25,7 @@ class PqRedriveContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void redrive(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{rc}";
       String dl = "dlq:{rc}";
       String msgKey = "pq:{rc}:m:k";

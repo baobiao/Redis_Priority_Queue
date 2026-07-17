@@ -6,12 +6,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== stats on: $e =="
-  load_library "$e"
 
   q="pq:{st}"; pfx="pq:{st}:m:"; dl="dlq:{st}"
   engine_cli "$e" DEL "$q" "$dl" "${pfx}A" "${pfx}B" "${pfx}C" "${pfx}D" >/dev/null
@@ -62,6 +59,6 @@ for e in $ENGINES; do
   out=$(fcall_ro "$e" pq_stats 2 "$eq" "$epfx" 1000 30000)
   expect_contains "empty queue: depth 0" "0" "$out"
   expect_contains "empty queue: front_priority -1" "-1" "$out"
-done
+}
 
-finish
+run_suite suite

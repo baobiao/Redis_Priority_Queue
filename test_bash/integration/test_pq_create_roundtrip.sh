@@ -4,12 +4,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== create round-trip on: $e =="
-  load_library "$e"
 
   # Defaults
   engine_cli "$e" DEL "q:{d1}" >/dev/null
@@ -36,6 +33,6 @@ for e in $ENGINES; do
   expect "partial Payload"  "x" "$(engine_cli "$e" HGET "q:{p1}" Payload)"
   expect "partial Priority" "7" "$(engine_cli "$e" HGET "q:{p1}" Priority)"
   expect "partial default ReadAttempts" "0" "$(engine_cli "$e" HGET "q:{p1}" ReadAttempts)"
-done
+}
 
-finish
+run_suite suite

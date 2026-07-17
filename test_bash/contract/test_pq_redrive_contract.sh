@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== redrive contract on: $e =="
-  load_library "$e"
   q="pq:{rc}"; pfx="pq:{rc}:m:"; dl="dlq:{rc}"
   engine_cli "$e" DEL "$q" "$dl" "${pfx}k" >/dev/null
 
@@ -42,6 +39,6 @@ for e in $ENGINES; do
   # Write function: must be rejected under FCALL_RO.
   out=$(fcall_ro "$e" pq_redrive 3 "$dl" "$q" "${pfx}k" "$mk" 2>&1 || true)
   expect_contains "redrive rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
-done
+}
 
-finish
+run_suite suite

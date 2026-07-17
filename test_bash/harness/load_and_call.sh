@@ -55,3 +55,18 @@ finish() {
   echo "[$TESTS_RUN assertions, $TESTS_FAIL failed]"
   [ "$TESTS_FAIL" -eq 0 ]
 }
+
+# Run <suite_fn> once per engine (ENGINES, default "redis valkey"), bringing the
+# engines up and loading the library before each call; <suite_fn> receives the
+# engine name as $1. Prints the assertion summary and exits non-zero on failure.
+# Removes the per-suite ENGINES/up/loop/finish boilerplate (Feature 008).
+run_suite() {
+  local suite_fn="$1"
+  ENGINES="${ENGINES:-redis valkey}"
+  up >/dev/null
+  for e in $ENGINES; do
+    load_library "$e"
+    "$suite_fn" "$e"
+  done
+  finish
+}

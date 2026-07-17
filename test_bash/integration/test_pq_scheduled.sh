@@ -6,12 +6,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== scheduled delivery on: $e =="
-  load_library "$e"
 
   # --- Future VisibleAt: skipped before, delivered at/after (boundary now==VisibleAt) ---
   q="pq:{sc}"; pfx="pq:{sc}:m:"
@@ -45,6 +42,6 @@ for e in $ENGINES; do
   fcall "$e" pq_enqueue 2 "$q" "${pfx}Y" Y 2 Priority 5 Payload PAY-Y >/dev/null   # no VisibleAt field
   out=$(fcall "$e" pq_dequeue 2 "$q" "$pfx" 1 30000)
   expect_contains "omitted VisibleAt defaults to immediately visible" "PAY-Y" "$out"
-done
+}
 
-finish
+run_suite suite

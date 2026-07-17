@@ -27,8 +27,7 @@ class PqDequeueContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void dequeue(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("pq:{c1}", "pq:{c1}:m:x");
 
       // Empty queue -> null reply (empty output).

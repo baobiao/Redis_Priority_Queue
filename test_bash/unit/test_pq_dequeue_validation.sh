@@ -6,12 +6,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== dequeue/ack/nack validation on: $e =="
-  load_library "$e"
 
   q="pq:{u1}"; pfx="pq:{u1}:m:"
   engine_cli "$e" DEL "$q" "${pfx}y" "${pfx}z" >/dev/null
@@ -74,6 +71,6 @@ for e in $ENGINES; do
   expect "y still in-flight (DirtyBit=1)" "1" "$(engine_cli "$e" HGET "${pfx}y" DirtyBit)"
   expect "y ReadAttempts unchanged (1)"   "1" "$(engine_cli "$e" HGET "${pfx}y" ReadAttempts)"
   expect "queue still has 1 member"       "1" "$(engine_cli "$e" ZCARD "$q")"
-done
+}
 
-finish
+run_suite suite

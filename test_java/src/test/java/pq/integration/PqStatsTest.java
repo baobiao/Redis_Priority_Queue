@@ -23,8 +23,7 @@ class PqStatsTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void depthsBreakdownAndAge(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{st}", pfx = "pq:{st}:m:", dl = "dlq:{st}";
       j.del(q, dl, pfx + "A", pfx + "B", pfx + "C", pfx + "D");
       // A available (pri5), B available (pri10), C delayed (VisibleAt future), D will be leased.
@@ -75,8 +74,7 @@ class PqStatsTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void emptyQueue(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String eq = "pq:{se}", epfx = "pq:{se}:m:";
       j.del(eq);
       Object out = Pq.fcallRo(j, "pq_stats", List.of(eq, epfx), "1000", "30000");

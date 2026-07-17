@@ -23,8 +23,7 @@ class PqReadContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void read(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       // Different hash tags -> different slots, so delete individually (cluster-safe).
       j.del("q:{r1}");
       j.del("q:{absent}");

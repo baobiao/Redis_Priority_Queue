@@ -26,8 +26,7 @@ class PqEnqueueRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void priorityOrderingInclBoundaries(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("pq:{o1}", "pq:{o1}:m:low", "pq:{o1}:m:mid", "pq:{o1}:m:hi",
             "pq:{o1}:m:min", "pq:{o1}:m:max");
       Pq.fcall(j, "pq_enqueue", List.of("pq:{o1}", "pq:{o1}:m:low"), "low", "1", "Priority", "1000");
@@ -47,8 +46,7 @@ class PqEnqueueRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void fifoWithinEqualPriority(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("pq:{f1}", "pq:{f1}:m:a", "pq:{f1}:m:b", "pq:{f1}:m:c");
       // Enqueued out of order (b, a, c) but with sequences 11, 10, 12 at equal Priority.
       Pq.fcall(j, "pq_enqueue", List.of("pq:{f1}", "pq:{f1}:m:b"), "b", "11", "Priority", "50");
@@ -62,8 +60,7 @@ class PqEnqueueRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void storedMessageFidelity(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("pq:{r1}", "pq:{r1}:m:1");
       Pq.fcall(j, "pq_enqueue", List.of("pq:{r1}", "pq:{r1}:m:1"),
           "1", "1", "Payload", "order-42", "Priority", "5");

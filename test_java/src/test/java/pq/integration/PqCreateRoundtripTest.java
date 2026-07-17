@@ -20,8 +20,7 @@ class PqCreateRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void defaults(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("q:{d1}");
       Pq.fcall(j, "pq_create", List.of("q:{d1}"));
       assertEquals("0",    j.hget("q:{d1}", "ReadAttempts"), "default ReadAttempts");
@@ -35,8 +34,7 @@ class PqCreateRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void explicitValues(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("q:{v1}");
       // Explicit values incl. large epoch-ms and DirtyBit token 'true'.
       Pq.fcall(j, "pq_create", List.of("q:{v1}"),
@@ -53,8 +51,7 @@ class PqCreateRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void partial(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("q:{p1}");
       // Only Payload + Priority supplied; the rest default.
       Pq.fcall(j, "pq_create", List.of("q:{p1}"), "Payload", "x", "Priority", "7");

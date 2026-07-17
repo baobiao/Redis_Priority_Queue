@@ -20,8 +20,7 @@ class PqValidationTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void validationRules(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("q:{bad}");
 
       Pq.assertError("EINVAL: ReadAttempts",

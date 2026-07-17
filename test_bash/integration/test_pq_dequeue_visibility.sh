@@ -6,12 +6,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== dequeue visibility + fencing on: $e =="
-  load_library "$e"
 
   q="pq:{v1}"; pfx="pq:{v1}:m:"; member="$(printf '%020d:%s' 1 v)"
   engine_cli "$e" DEL "$q" "${pfx}v" >/dev/null
@@ -47,6 +44,6 @@ for e in $ENGINES; do
   expect "B ack with current token -> OK" "OK" "$out"
   expect "message removed after B ack" "0" "$(engine_cli "$e" EXISTS "${pfx}v")"
   expect "queue member removed after B ack" "0" "$(engine_cli "$e" ZCARD "$q")"
-done
+}
 
-finish
+run_suite suite

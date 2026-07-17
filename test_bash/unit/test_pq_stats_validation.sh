@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== stats validation on: $e =="
-  load_library "$e"
   q="pq:{sv}"; pfx="pq:{sv}:m:"
   engine_cli "$e" DEL "$q" "${pfx}1" >/dev/null
   fcall "$e" pq_enqueue 2 "$q" "${pfx}1" 1 1 Priority 5 Payload x >/dev/null
@@ -38,6 +35,6 @@ for e in $ENGINES; do
 
   # Read-only: the seeded message is unchanged (never leased) after all calls.
   expect "stats wrote nothing (DirtyBit still 0)" "0" "$(engine_cli "$e" HGET "${pfx}1" DirtyBit)"
-done
+}
 
-finish
+run_suite suite

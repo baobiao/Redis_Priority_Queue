@@ -6,12 +6,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== retry backoff on: $e =="
-  load_library "$e"
 
   q="pq:{bo}"; pfx="pq:{bo}:m:"
   engine_cli "$e" DEL "$q" "${pfx}1" >/dev/null
@@ -48,6 +45,6 @@ for e in $ENGINES; do
   # Fencing still applies to a nack-with-delay: a stale token is rejected.
   out=$(fcall "$e" pq_nack 1 "${pfx}2" 999 5000 2>&1 || true)
   expect_contains "stale token rejected (EFENCED) even with a delay" "EFENCED" "$out"
-done
+}
 
-finish
+run_suite suite

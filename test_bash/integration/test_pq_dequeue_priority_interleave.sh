@@ -17,12 +17,9 @@ expect_absent() { # <label> <needle> <haystack>
   esac
 }
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== dequeue priority interleave on: $e =="
-  load_library "$e"
 
   q="pq:{pi1}"; pfx="pq:{pi1}:m:"
   engine_cli "$e" DEL "$q" "${pfx}A" "${pfx}B" "${pfx}C" >/dev/null
@@ -65,6 +62,6 @@ for e in $ENGINES; do
   # All three now leased and unexpired -> nothing available (null, not empty payload).
   dNull=$(fcall "$e" pq_dequeue 2 "$q" "$pfx" 1003 30000)
   expect "acquire 4 returns null (all three leased)" "" "$dNull"
-done
+}
 
-finish
+run_suite suite

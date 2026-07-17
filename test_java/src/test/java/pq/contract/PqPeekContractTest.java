@@ -27,8 +27,7 @@ class PqPeekContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void peek(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{pc}";
       String mk = "pq:{pc}:m:k";
       String pfx = "pq:{pc}:m:";

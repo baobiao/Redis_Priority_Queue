@@ -28,8 +28,7 @@ class PqPeekValidationTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void peekInputAndMalformedValidation(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del(Q, PFX + "a");
       Pq.fcall(j, "pq_enqueue", List.of(Q, PFX + "a"), "a", "1", "Priority", "5", "Payload", "hi");
 
@@ -73,8 +72,7 @@ class PqPeekValidationTest {
   void tagMismatch(Engines.Combo combo) {
     Assumptions.assumeTrue(combo.topology() == Engines.Topology.STANDALONE,
         "cross-slot ETAG check is standalone-only");
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       Pq.assertError("ETAG",
           () -> Pq.fcallRo(j, "pq_peek", List.of("pq:{pv}", "pq:{nope}:m:"), "1000", "30000"));
     }

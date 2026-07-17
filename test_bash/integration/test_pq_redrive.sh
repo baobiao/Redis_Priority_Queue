@@ -7,12 +7,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== redrive on: $e =="
-  load_library "$e"
 
   # ---- Dead-letter G (cap=1), then redrive it ----
   q="pq:{rd}"; pfx="pq:{rd}:m:"; dl="dlq:{rd}"
@@ -50,6 +47,6 @@ for e in $ENGINES; do
   expect_contains "already-in-source redrive -> EQDUP" "EQDUP" "$out"
   expect "source still holds H (unchanged)" "5" "$(engine_cli "$e" ZSCORE "$q2" "$mH")"
   expect "DLQ copy of H untouched by the rejected redrive" "5" "$(engine_cli "$e" ZSCORE "$dl2" "$mH")"
-done
+}
 
-finish
+run_suite suite

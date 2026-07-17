@@ -27,8 +27,7 @@ class PqDequeueValidationTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void dequeueAckNackValidation(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del(Q, PFX + "y", PFX + "z");
 
       // ----- pq_dequeue input validation -----
@@ -84,8 +83,7 @@ class PqDequeueValidationTest {
     // before the function's ETAG guard can run, so this check is standalone-only.
     Assumptions.assumeTrue(combo.topology() == Engines.Topology.STANDALONE,
         "cross-slot ETAG check is standalone-only");
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       Pq.assertError("ETAG", () -> Pq.fcall(j, "pq_dequeue", List.of(Q, "pq:{u2}:m:"), "1000", "30000"));
     }
   }

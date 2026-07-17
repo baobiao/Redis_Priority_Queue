@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== reap validation on: $e =="
-  load_library "$e"
   dl="dlq:{rv}"; pfx="pq:{rv}:m:"
   engine_cli "$e" DEL "$dl" "${pfx}1" >/dev/null
   # Seed one clearly-expired entry; assert it survives every rejected call.
@@ -37,6 +34,6 @@ for e in $ENGINES; do
   # Nothing was written on any failure: the expired entry is still present.
   expect "no write on failure: member intact" "5" "$(engine_cli "$e" ZSCORE "$dl" "$m1")"
   expect "no write on failure: hash intact" "1" "$(engine_cli "$e" EXISTS "${pfx}1")"
-done
+}
 
-finish
+run_suite suite

@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== reap contract on: $e =="
-  load_library "$e"
   dl="dlq:{rc}"; pfx="pq:{rc}:m:"
   engine_cli "$e" DEL "$dl" "${pfx}1" >/dev/null
 
@@ -54,6 +51,6 @@ for e in $ENGINES; do
   # Write function: rejected under FCALL_RO.
   out=$(fcall_ro "$e" pq_reap 2 "$dl" "$pfx" 1000 1000 10 2>&1 || true)
   expect_contains "reap rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
-done
+}
 
-finish
+run_suite suite

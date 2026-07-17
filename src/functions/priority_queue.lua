@@ -87,6 +87,7 @@ end
 -- which message is "next". Determinism: now/timeout are caller-supplied via ARGV
 -- (Principle VII); no server clock is read here.
 local function lease_available(dirtybit, readdatetime, now, timeout)
+  local tonumber = tonumber
   if dirtybit == '0' then
     return true
   elseif dirtybit == '1' then
@@ -102,12 +103,14 @@ end
 -- immediately visible. now is caller-supplied via ARGV (Principle VII; no clock).
 -- A message is deliverable only when lease_available(...) AND is_visible(...).
 local function is_visible(visibleat, now)
+  local tonumber = tonumber
   return (tonumber(visibleat) or 0) <= now
 end
 
 -- Encode a supplied value for storage, validating per field.
 -- Returns (encoded_string, nil) on success or (nil, "ECODE: Field") on failure.
 local function encode_field(name, value)
+  local tonumber = tonumber
   if name == 'ReadAttempts' or name == 'ReadDateTime' or name == 'VisibleAt' or name == 'DeadLetteredAt' then
     local n = tonumber(value)
     if not is_int(n) or n < 0 or n > MAX_SAFE_INT then
@@ -186,17 +189,18 @@ end
 --   Stores nothing on any validation failure.
 -- ---------------------------------------------------------------------------
 local function pq_create(keys, args)
+  local rcall, rerr, rstatus = redis.call, redis.error_reply, redis.status_reply
   if #keys ~= 1 then
-    return redis.error_reply('PQ EKEYS: exactly one key required')
+    return rerr('PQ EKEYS: exactly one key required')
   end
   local hset, err = build_message(args)
   if err then
-    return redis.error_reply('PQ ' .. err)
+    return rerr('PQ ' .. err)
   end
   local cmd = { 'HSET', keys[1] }
   for _, v in ipairs(hset) do cmd[#cmd + 1] = v end
-  redis.call(unpack(cmd))
-  return redis.status_reply('OK')
+  rcall(unpack(cmd))
+  return rstatus('OK')
 end
 
 -- ---------------------------------------------------------------------------
@@ -208,24 +212,25 @@ end
 --   false->nil ambiguity) - see contracts/functions.md.
 -- ---------------------------------------------------------------------------
 local function pq_read(keys, args)
+  local rcall, rerr, rstatus, tonumber = redis.call, redis.error_reply, redis.status_reply, tonumber
   if #keys ~= 1 then
-    return redis.error_reply('PQ EKEYS: exactly one key required')
+    return rerr('PQ EKEYS: exactly one key required')
   end
   local key = keys[1]
-  if redis.call('EXISTS', key) == 0 then
-    return redis.status_reply('NOTFOUND')
+  if rcall('EXISTS', key) == 0 then
+    return rstatus('NOTFOUND')
   end
-  local t = redis.call('TYPE', key)
+  local t = rcall('TYPE', key)
   if t.ok ~= 'hash' then
-    return redis.error_reply('PQ EMALFORMED: key is not a hash')
+    return rerr('PQ EMALFORMED: key is not a hash')
   end
-  local vals = redis.call('HMGET', key,
+  local vals = rcall('HMGET', key,
     'ReadAttempts', 'DirtyBit', 'ReadDateTime', 'Priority', 'Payload', 'VisibleAt', 'DeadLetteredAt')
   -- The five original fields remain strictly required; a MISSING VisibleAt (pre-005)
   -- or DeadLetteredAt (pre-006) is tolerated and reported as 0.
   for idx = 1, 5 do
     if vals[idx] == false then
-      return redis.error_reply('PQ EMALFORMED: missing field ' .. FIELDS[idx])
+      return rerr('PQ EMALFORMED: missing field ' .. FIELDS[idx])
     end
   end
   return {
@@ -246,11 +251,12 @@ end
 --   matching PQ E... error.
 -- ---------------------------------------------------------------------------
 local function pq_validate(keys, args)
+  local rerr, rstatus = redis.error_reply, redis.status_reply
   local _, err = build_message(args)
   if err then
-    return redis.error_reply('PQ ' .. err)
+    return rerr('PQ ' .. err)
   end
-  return redis.status_reply('VALID')
+  return rstatus('VALID')
 end
 
 -- ---------------------------------------------------------------------------
@@ -264,16 +270,17 @@ end
 --   Fail-before-write: on any error nothing is written to either key.
 -- ---------------------------------------------------------------------------
 local function pq_enqueue(keys, args)
+  local rcall, rerr, rstatus, tonumber = redis.call, redis.error_reply, redis.status_reply, tonumber
   if #keys ~= 2 then
-    return redis.error_reply('PQ EKEYS: exactly two keys required')
+    return rerr('PQ EKEYS: exactly two keys required')
   end
   local id = args[1]
   if id == nil or id == '' then
-    return redis.error_reply('PQ EID: id must be a non-empty string')
+    return rerr('PQ EID: id must be a non-empty string')
   end
   local seq = tonumber(args[2])
   if not is_int(seq) or seq < 0 or seq > MAX_SAFE_INT then
-    return redis.error_reply('PQ ESEQ: sequence must be a non-negative integer')
+    return rerr('PQ ESEQ: sequence must be a non-negative integer')
   end
 
   -- Field pairs are ARGV[3..]; reuse the Feature 001 builder (defaults + validation).
@@ -283,7 +290,7 @@ local function pq_enqueue(keys, args)
   end
   local hset, err = build_message(fields)
   if err then
-    return redis.error_reply('PQ ' .. err)
+    return rerr('PQ ' .. err)
   end
 
   -- score = the message's Priority (from the built, encoded field list).
@@ -298,25 +305,25 @@ local function pq_enqueue(keys, args)
   local member = string.format('%020.0f', seq) .. ':' .. id
 
   -- Fail-before-write preconditions: reject conflicts and wrong-type targets.
-  if redis.call('EXISTS', keys[2]) == 1 then
-    return redis.error_reply('PQ EEXISTS: message location occupied')
+  if rcall('EXISTS', keys[2]) == 1 then
+    return rerr('PQ EEXISTS: message location occupied')
   end
-  if redis.call('EXISTS', keys[1]) == 1 then
-    local t = redis.call('TYPE', keys[1])
+  if rcall('EXISTS', keys[1]) == 1 then
+    local t = rcall('TYPE', keys[1])
     if t.ok ~= 'zset' then
-      return redis.error_reply('PQ EMALFORMED: queue is not a sorted set')
+      return rerr('PQ EMALFORMED: queue is not a sorted set')
     end
   end
-  if redis.call('ZSCORE', keys[1], member) ~= false then
-    return redis.error_reply('PQ EQDUP: already enqueued')
+  if rcall('ZSCORE', keys[1], member) ~= false then
+    return rerr('PQ EQDUP: already enqueued')
   end
 
   -- Write: store the message Hash, then index it in the queue Sorted Set.
   local cmd = { 'HSET', keys[2] }
   for _, v in ipairs(hset) do cmd[#cmd + 1] = v end
-  redis.call(unpack(cmd))
-  redis.call('ZADD', keys[1], score, member)
-  return redis.status_reply('OK')
+  rcall(unpack(cmd))
+  rcall('ZADD', keys[1], score, member)
+  return rstatus('OK')
 end
 
 -- ---------------------------------------------------------------------------
@@ -332,6 +339,7 @@ end
 --   KEYS[2] .. id (the sanctioned same-slot construction). Fail-before-write.
 -- ---------------------------------------------------------------------------
 local function pq_dequeue(keys, args)
+  local rcall, rerr, tonumber = redis.call, redis.error_reply, tonumber
   -- KEYS[1]=source queue, KEYS[2]=message-key prefix, KEYS[3]=DLQ (optional).
   -- With KEYS[3] present (dead-letter mode) ARGV[4]=cap is required: an available
   -- candidate whose ReadAttempts >= cap is moved to the DLQ (index-only, score =
@@ -339,7 +347,7 @@ local function pq_dequeue(keys, args)
   -- With only 2 keys the behaviour is exactly Feature 003. See
   -- specs/004-dead-letter-peek/contracts/functions.md.
   if #keys ~= 2 and #keys ~= 3 then
-    return redis.error_reply('PQ EKEYS: two or three keys required')
+    return rerr('PQ EKEYS: two or three keys required')
   end
   local queue = keys[1]
   local prefix = keys[2]
@@ -347,24 +355,24 @@ local function pq_dequeue(keys, args)
 
   local now = tonumber(args[1])
   if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
-    return redis.error_reply('PQ ENOW: now must be a non-negative integer')
+    return rerr('PQ ENOW: now must be a non-negative integer')
   end
   local timeout = tonumber(args[2])
   if not is_int(timeout) or timeout < 1 or timeout > MAX_SAFE_INT then
-    return redis.error_reply('PQ ETMO: timeout must be a positive integer')
+    return rerr('PQ ETMO: timeout must be a positive integer')
   end
   local max_scan = 0
   if args[3] ~= nil then
     max_scan = tonumber(args[3])
     if not is_int(max_scan) or max_scan < 0 or max_scan > MAX_SAFE_INT then
-      return redis.error_reply('PQ ESCAN: max_scan must be a non-negative integer')
+      return rerr('PQ ESCAN: max_scan must be a non-negative integer')
     end
   end
   local cap = nil
   if dlq ~= nil then
     cap = tonumber(args[4])
     if not is_int(cap) or cap < 1 or cap > MAX_SAFE_INT then
-      return redis.error_reply('PQ ECAP: cap must be a positive integer')
+      return rerr('PQ ECAP: cap must be a positive integer')
     end
   end
 
@@ -373,27 +381,27 @@ local function pq_dequeue(keys, args)
   local qtag = hash_tag(queue)
   local ptag = hash_tag(prefix)
   if qtag == nil or ptag == nil or qtag ~= ptag then
-    return redis.error_reply('PQ ETAG: queue and message-key prefix must share one hash tag')
+    return rerr('PQ ETAG: queue and message-key prefix must share one hash tag')
   end
   if dlq ~= nil then
     -- The DLQ takes writes in the same call, so it must share the queue's slot.
     local dtag = hash_tag(dlq)
     if dtag == nil or dtag ~= qtag then
-      return redis.error_reply('PQ ETAG: dead-letter queue must share the queue hash tag')
+      return rerr('PQ ETAG: dead-letter queue must share the queue hash tag')
     end
   end
 
-  if redis.call('EXISTS', queue) == 0 then
+  if rcall('EXISTS', queue) == 0 then
     return false -- empty queue -> nothing available (RESP null)
   end
-  local qt = redis.call('TYPE', queue)
+  local qt = rcall('TYPE', queue)
   if qt.ok ~= 'zset' then
-    return redis.error_reply('PQ EMALFORMED: queue is not a sorted set')
+    return rerr('PQ EMALFORMED: queue is not a sorted set')
   end
-  if dlq ~= nil and redis.call('EXISTS', dlq) == 1 then
-    local dt = redis.call('TYPE', dlq)
+  if dlq ~= nil and rcall('EXISTS', dlq) == 1 then
+    local dt = rcall('TYPE', dlq)
     if dt.ok ~= 'zset' then
-      return redis.error_reply('PQ EMALFORMED: dead-letter queue is not a sorted set')
+      return rerr('PQ EMALFORMED: dead-letter queue is not a sorted set')
     end
   end
 
@@ -402,7 +410,7 @@ local function pq_dequeue(keys, args)
   -- has no LIMIT option, so bound the fetch itself).
   local stop = -1
   if max_scan > 0 then stop = max_scan - 1 end
-  local members = redis.call('ZRANGE', queue, 0, stop)
+  local members = rcall('ZRANGE', queue, 0, stop)
 
   for _, member in ipairs(members) do
     -- id = text after the first ':' (the sequence is a fixed 20-digit prefix).
@@ -410,18 +418,18 @@ local function pq_dequeue(keys, args)
     local id = colon and string.sub(member, colon + 1) or member
     local mkey = prefix .. id
 
-    if redis.call('EXISTS', mkey) == 0 then
+    if rcall('EXISTS', mkey) == 0 then
       -- Dangling member (message Hash deleted out of band): clean up and skip.
-      redis.call('ZREM', queue, member)
+      rcall('ZREM', queue, member)
     else
-      local mt = redis.call('TYPE', mkey)
+      local mt = rcall('TYPE', mkey)
       if mt.ok ~= 'hash' then
-        return redis.error_reply('PQ EMALFORMED: message ' .. mkey .. ' is not a hash')
+        return rerr('PQ EMALFORMED: message ' .. mkey .. ' is not a hash')
       end
-      local vals = redis.call('HMGET', mkey,
+      local vals = rcall('HMGET', mkey,
         'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload', 'VisibleAt')
       if vals[1] == false or vals[2] == false or vals[3] == false then
-        return redis.error_reply('PQ EMALFORMED: message ' .. mkey .. ' missing lease field')
+        return rerr('PQ EMALFORMED: message ' .. mkey .. ' missing lease field')
       end
       -- Deliverable only when lease-available AND visible (now >= VisibleAt). A
       -- missing VisibleAt (vals[6]) coalesces to 0 = visible (back-compat). A
@@ -435,12 +443,12 @@ local function pq_dequeue(keys, args)
           -- already exists (no duplicate). Stamp DeadLetteredAt=now on the Hash so
           -- retention (Feature 006) can age it out; no other field is touched. Then
           -- continue scanning for the next deliverable message.
-          redis.call('ZREM', queue, member)
-          redis.call('ZADD', dlq, vals[4], member)
-          redis.call('HSET', mkey, 'DeadLetteredAt', string.format('%.0f', now))
+          rcall('ZREM', queue, member)
+          rcall('ZADD', dlq, vals[4], member)
+          rcall('HSET', mkey, 'DeadLetteredAt', string.format('%.0f', now))
         else
-          local new_ra = redis.call('HINCRBY', mkey, 'ReadAttempts', 1)
-          redis.call('HSET', mkey, 'DirtyBit', '1', 'ReadDateTime', string.format('%.0f', now))
+          local new_ra = rcall('HINCRBY', mkey, 'ReadAttempts', 1)
+          rcall('HSET', mkey, 'DirtyBit', '1', 'ReadDateTime', string.format('%.0f', now))
           return {
             'id',           id,
             'member',       member,
@@ -465,36 +473,37 @@ end
 --   Fenced: a superseded lease is rejected (EFENCED) with no side effects.
 -- ---------------------------------------------------------------------------
 local function pq_ack(keys, args)
+  local rcall, rerr, rstatus, tonumber = redis.call, redis.error_reply, redis.status_reply, tonumber
   if #keys ~= 2 then
-    return redis.error_reply('PQ EKEYS: exactly two keys required')
+    return rerr('PQ EKEYS: exactly two keys required')
   end
   local queue = keys[1]
   local mkey = keys[2]
   local member = args[1]
   local token = tonumber(args[2])
   if member == nil or member == '' or not is_int(token) then
-    return redis.error_reply('PQ EARGS: member and token required')
+    return rerr('PQ EARGS: member and token required')
   end
-  if redis.call('EXISTS', mkey) == 0 then
-    return redis.status_reply('NOOP') -- already settled
+  if rcall('EXISTS', mkey) == 0 then
+    return rstatus('NOOP') -- already settled
   end
-  local mt = redis.call('TYPE', mkey)
+  local mt = rcall('TYPE', mkey)
   if mt.ok ~= 'hash' then
-    return redis.error_reply('PQ EMALFORMED: key is not a hash')
+    return rerr('PQ EMALFORMED: key is not a hash')
   end
-  local vals = redis.call('HMGET', mkey, 'DirtyBit', 'ReadAttempts')
+  local vals = rcall('HMGET', mkey, 'DirtyBit', 'ReadAttempts')
   if vals[1] == false or vals[2] == false then
-    return redis.error_reply('PQ EMALFORMED: missing lease field')
+    return rerr('PQ EMALFORMED: missing lease field')
   end
   if vals[1] ~= '1' then
-    return redis.error_reply('PQ ENOTLEASED: message not in-flight')
+    return rerr('PQ ENOTLEASED: message not in-flight')
   end
   if tonumber(vals[2]) ~= token then
-    return redis.error_reply('PQ EFENCED: lease superseded')
+    return rerr('PQ EFENCED: lease superseded')
   end
-  redis.call('ZREM', queue, member)
-  redis.call('DEL', mkey)
-  return redis.status_reply('OK')
+  rcall('ZREM', queue, member)
+  rcall('DEL', mkey)
+  return rstatus('OK')
 end
 
 -- ---------------------------------------------------------------------------
@@ -509,46 +518,47 @@ end
 --   gone; fenced.
 -- ---------------------------------------------------------------------------
 local function pq_nack(keys, args)
+  local rcall, rerr, rstatus, tonumber = redis.call, redis.error_reply, redis.status_reply, tonumber
   if #keys ~= 1 then
-    return redis.error_reply('PQ EKEYS: exactly one key required')
+    return rerr('PQ EKEYS: exactly one key required')
   end
   local mkey = keys[1]
   local token = tonumber(args[1])
   if not is_int(token) then
-    return redis.error_reply('PQ EARGS: token required')
+    return rerr('PQ EARGS: token required')
   end
   -- Optional not-before (retry backoff). Validate up front (fail-before-write).
   local visible_at = nil
   if args[2] ~= nil then
     visible_at = tonumber(args[2])
     if not is_int(visible_at) or visible_at < 0 or visible_at > MAX_SAFE_INT then
-      return redis.error_reply('PQ EVIS: visibleAt must be a non-negative integer')
+      return rerr('PQ EVIS: visibleAt must be a non-negative integer')
     end
   end
-  if redis.call('EXISTS', mkey) == 0 then
-    return redis.status_reply('NOOP') -- already settled
+  if rcall('EXISTS', mkey) == 0 then
+    return rstatus('NOOP') -- already settled
   end
-  local mt = redis.call('TYPE', mkey)
+  local mt = rcall('TYPE', mkey)
   if mt.ok ~= 'hash' then
-    return redis.error_reply('PQ EMALFORMED: key is not a hash')
+    return rerr('PQ EMALFORMED: key is not a hash')
   end
-  local vals = redis.call('HMGET', mkey, 'DirtyBit', 'ReadAttempts')
+  local vals = rcall('HMGET', mkey, 'DirtyBit', 'ReadAttempts')
   if vals[1] == false or vals[2] == false then
-    return redis.error_reply('PQ EMALFORMED: missing lease field')
+    return rerr('PQ EMALFORMED: missing lease field')
   end
   if vals[1] ~= '1' then
-    return redis.error_reply('PQ ENOTLEASED: message not in-flight')
+    return rerr('PQ ENOTLEASED: message not in-flight')
   end
   if tonumber(vals[2]) ~= token then
-    return redis.error_reply('PQ EFENCED: lease superseded')
+    return rerr('PQ EFENCED: lease superseded')
   end
   if visible_at ~= nil then
     -- Retry backoff: release AND hide until now >= VisibleAt.
-    redis.call('HSET', mkey, 'DirtyBit', '0', 'VisibleAt', string.format('%.0f', visible_at))
+    rcall('HSET', mkey, 'DirtyBit', '0', 'VisibleAt', string.format('%.0f', visible_at))
   else
-    redis.call('HSET', mkey, 'DirtyBit', '0') -- retain ReadDateTime/ReadAttempts/VisibleAt
+    rcall('HSET', mkey, 'DirtyBit', '0') -- retain ReadDateTime/ReadAttempts/VisibleAt
   end
-  return redis.status_reply('OK')
+  return rstatus('OK')
 end
 
 -- ---------------------------------------------------------------------------
@@ -566,26 +576,27 @@ end
 --     {id, member, DirtyBit(0|1), ReadAttempts, ReadDateTime, Priority, Payload}.
 -- ---------------------------------------------------------------------------
 local function pq_peek(keys, args)
+  local rcall, rerr, tonumber = redis.call, redis.error_reply, tonumber
   if #keys ~= 2 then
-    return redis.error_reply('PQ EKEYS: exactly two keys required')
+    return rerr('PQ EKEYS: exactly two keys required')
   end
   local queue = keys[1]
   local prefix = keys[2]
 
   local now = tonumber(args[1])
   if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
-    return redis.error_reply('PQ ENOW: now must be a non-negative integer')
+    return rerr('PQ ENOW: now must be a non-negative integer')
   end
   local timeout = tonumber(args[2])
   if not is_int(timeout) or timeout < 1 or timeout > MAX_SAFE_INT then
-    return redis.error_reply('PQ ETMO: timeout must be a positive integer')
+    return rerr('PQ ETMO: timeout must be a positive integer')
   end
   local count = 1
   local topn = false
   if args[3] ~= nil then
     count = tonumber(args[3])
     if not is_int(count) or count < 1 or count > MAX_SAFE_INT then
-      return redis.error_reply('PQ ECOUNT: count must be a positive integer')
+      return rerr('PQ ECOUNT: count must be a positive integer')
     end
     if count > 1 then topn = true end
   end
@@ -593,22 +604,22 @@ local function pq_peek(keys, args)
   local qtag = hash_tag(queue)
   local ptag = hash_tag(prefix)
   if qtag == nil or ptag == nil or qtag ~= ptag then
-    return redis.error_reply('PQ ETAG: queue and message-key prefix must share one hash tag')
+    return rerr('PQ ETAG: queue and message-key prefix must share one hash tag')
   end
 
-  if redis.call('EXISTS', queue) == 0 then
+  if rcall('EXISTS', queue) == 0 then
     if topn then return {} else return false end
   end
-  local qt = redis.call('TYPE', queue)
+  local qt = rcall('TYPE', queue)
   if qt.ok ~= 'zset' then
-    return redis.error_reply('PQ EMALFORMED: queue is not a sorted set')
+    return rerr('PQ EMALFORMED: queue is not a sorted set')
   end
 
   -- Top-N fetches only the front `count` members; single mode scans the front
   -- (bounded by queue size) to skip leased/dangling and find the first available.
   local stop = -1
   if topn then stop = count - 1 end
-  local members = redis.call('ZRANGE', queue, 0, stop)
+  local members = rcall('ZRANGE', queue, 0, stop)
 
   local results = {}
   for _, member in ipairs(members) do
@@ -616,22 +627,22 @@ local function pq_peek(keys, args)
     local id = colon and string.sub(member, colon + 1) or member
     local mkey = prefix .. id
 
-    if redis.call('EXISTS', mkey) == 1 then
-      local mt = redis.call('TYPE', mkey)
+    if rcall('EXISTS', mkey) == 1 then
+      local mt = rcall('TYPE', mkey)
       if mt.ok ~= 'hash' then
         if topn then
           -- observability: skip a malformed member
         else
-          return redis.error_reply('PQ EMALFORMED: message ' .. mkey .. ' is not a hash')
+          return rerr('PQ EMALFORMED: message ' .. mkey .. ' is not a hash')
         end
       else
-        local vals = redis.call('HMGET', mkey,
+        local vals = rcall('HMGET', mkey,
           'DirtyBit', 'ReadDateTime', 'ReadAttempts', 'Priority', 'Payload', 'VisibleAt', 'DeadLetteredAt')
         if vals[1] == false or vals[2] == false or vals[3] == false then
           if topn then
             -- observability: skip a member missing a lease field
           else
-            return redis.error_reply('PQ EMALFORMED: message ' .. mkey .. ' missing lease field')
+            return rerr('PQ EMALFORMED: message ' .. mkey .. ' missing lease field')
           end
         else
           local record = {
@@ -675,49 +686,50 @@ end
 --   must share one hash tag.
 -- ---------------------------------------------------------------------------
 local function pq_redrive(keys, args)
+  local rcall, rerr, rstatus = redis.call, redis.error_reply, redis.status_reply
   if #keys ~= 3 then
-    return redis.error_reply('PQ EKEYS: exactly three keys required')
+    return rerr('PQ EKEYS: exactly three keys required')
   end
   local dlq = keys[1]
   local queue = keys[2]
   local mkey = keys[3]
   local member = args[1]
   if member == nil or member == '' then
-    return redis.error_reply('PQ EARGS: member required')
+    return rerr('PQ EARGS: member required')
   end
 
   local dtag = hash_tag(dlq)
   local qtag = hash_tag(queue)
   local mtag = hash_tag(mkey)
   if dtag == nil or qtag == nil or mtag == nil or dtag ~= qtag or dtag ~= mtag then
-    return redis.error_reply('PQ ETAG: keys must share one hash tag')
+    return rerr('PQ ETAG: keys must share one hash tag')
   end
 
   -- Guards, all before any write:
-  if redis.call('ZSCORE', dlq, member) == false then
-    return redis.status_reply('NOOP') -- not in the dead-letter queue
+  if rcall('ZSCORE', dlq, member) == false then
+    return rstatus('NOOP') -- not in the dead-letter queue
   end
-  if redis.call('ZSCORE', queue, member) ~= false then
-    return redis.error_reply('PQ EQDUP: already present in source queue')
+  if rcall('ZSCORE', queue, member) ~= false then
+    return rerr('PQ EQDUP: already present in source queue')
   end
-  if redis.call('EXISTS', mkey) == 0 then
-    return redis.error_reply('PQ EMALFORMED: message hash missing')
+  if rcall('EXISTS', mkey) == 0 then
+    return rerr('PQ EMALFORMED: message hash missing')
   end
-  local mt = redis.call('TYPE', mkey)
+  local mt = rcall('TYPE', mkey)
   if mt.ok ~= 'hash' then
-    return redis.error_reply('PQ EMALFORMED: key is not a hash')
+    return rerr('PQ EMALFORMED: key is not a hash')
   end
-  local priority = redis.call('HGET', mkey, 'Priority')
+  local priority = rcall('HGET', mkey, 'Priority')
   if priority == false then
-    return redis.error_reply('PQ EMALFORMED: missing field Priority')
+    return rerr('PQ EMALFORMED: missing field Priority')
   end
 
-  redis.call('ZREM', dlq, member)
-  redis.call('ZADD', queue, priority, member)
+  rcall('ZREM', dlq, member)
+  rcall('ZADD', queue, priority, member)
   -- Reset delivery state so the redriven message is immediately deliverable;
   -- VisibleAt=0 clears any not-before. ReadDateTime is retained.
-  redis.call('HSET', mkey, 'ReadAttempts', '0', 'DirtyBit', '0', 'VisibleAt', '0', 'DeadLetteredAt', '0')
-  return redis.status_reply('OK')
+  rcall('HSET', mkey, 'ReadAttempts', '0', 'DirtyBit', '0', 'VisibleAt', '0', 'DeadLetteredAt', '0')
+  return rstatus('OK')
 end
 
 -- ---------------------------------------------------------------------------
@@ -732,42 +744,43 @@ end
 --   drain. Fail-before-write on validation.
 -- ---------------------------------------------------------------------------
 local function pq_reap(keys, args)
+  local rcall, rerr, tonumber = redis.call, redis.error_reply, tonumber
   if #keys ~= 2 then
-    return redis.error_reply('PQ EKEYS: exactly two keys required')
+    return rerr('PQ EKEYS: exactly two keys required')
   end
   local dlq = keys[1]
   local prefix = keys[2]
 
   local now = tonumber(args[1])
   if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
-    return redis.error_reply('PQ ENOW: now must be a non-negative integer')
+    return rerr('PQ ENOW: now must be a non-negative integer')
   end
   local retention = tonumber(args[2])
   if not is_int(retention) or retention < 0 or retention > MAX_SAFE_INT then
-    return redis.error_reply('PQ ERET: retention must be a non-negative integer')
+    return rerr('PQ ERET: retention must be a non-negative integer')
   end
   local limit = tonumber(args[3])
   if not is_int(limit) or limit < 1 or limit > MAX_SAFE_INT then
-    return redis.error_reply('PQ ELIMIT: limit must be a positive integer')
+    return rerr('PQ ELIMIT: limit must be a positive integer')
   end
 
   local dtag = hash_tag(dlq)
   local ptag = hash_tag(prefix)
   if dtag == nil or ptag == nil or dtag ~= ptag then
-    return redis.error_reply('PQ ETAG: dead-letter queue and message-key prefix must share one hash tag')
+    return rerr('PQ ETAG: dead-letter queue and message-key prefix must share one hash tag')
   end
 
-  if redis.call('EXISTS', dlq) == 0 then
+  if rcall('EXISTS', dlq) == 0 then
     return { 'removed', 0, 'scanned', 0, 'truncated', 0 }
   end
-  local dt = redis.call('TYPE', dlq)
+  local dt = rcall('TYPE', dlq)
   if dt.ok ~= 'zset' then
-    return redis.error_reply('PQ EMALFORMED: dead-letter queue is not a sorted set')
+    return rerr('PQ EMALFORMED: dead-letter queue is not a sorted set')
   end
 
   local cutoff = now - retention -- expired iff DeadLetteredAt <= cutoff
-  local card = redis.call('ZCARD', dlq)
-  local members = redis.call('ZRANGE', dlq, 0, limit - 1)
+  local card = rcall('ZCARD', dlq)
+  local members = rcall('ZRANGE', dlq, 0, limit - 1)
   local removed = 0
   local scanned = 0
   for _, member in ipairs(members) do
@@ -775,14 +788,14 @@ local function pq_reap(keys, args)
     local colon = string.find(member, ':', 1, true)
     local id = colon and string.sub(member, colon + 1) or member
     local mkey = prefix .. id
-    if redis.call('EXISTS', mkey) == 0 then
-      redis.call('ZREM', dlq, member) -- dangling member -> clean up
+    if rcall('EXISTS', mkey) == 0 then
+      rcall('ZREM', dlq, member) -- dangling member -> clean up
       removed = removed + 1
     else
-      local dla = tonumber(redis.call('HGET', mkey, 'DeadLetteredAt')) or 0
+      local dla = tonumber(rcall('HGET', mkey, 'DeadLetteredAt')) or 0
       if dla <= cutoff then
-        redis.call('ZREM', dlq, member)
-        redis.call('DEL', mkey)
+        rcall('ZREM', dlq, member)
+        rcall('DEL', mkey)
         removed = removed + 1
       end
     end
@@ -805,8 +818,9 @@ end
 --   oldest_dead_letter_age from the scanned DLQ prefix. Performs no writes.
 -- ---------------------------------------------------------------------------
 local function pq_stats(keys, args)
+  local rcall, rerr, tonumber = redis.call, redis.error_reply, tonumber
   if #keys ~= 2 and #keys ~= 3 then
-    return redis.error_reply('PQ EKEYS: two or three keys required')
+    return rerr('PQ EKEYS: two or three keys required')
   end
   local queue = keys[1]
   local prefix = keys[2]
@@ -814,51 +828,51 @@ local function pq_stats(keys, args)
 
   local now = tonumber(args[1])
   if not is_int(now) or now < 0 or now > MAX_SAFE_INT then
-    return redis.error_reply('PQ ENOW: now must be a non-negative integer')
+    return rerr('PQ ENOW: now must be a non-negative integer')
   end
   local timeout = tonumber(args[2])
   if not is_int(timeout) or timeout < 1 or timeout > MAX_SAFE_INT then
-    return redis.error_reply('PQ ETMO: timeout must be a positive integer')
+    return rerr('PQ ETMO: timeout must be a positive integer')
   end
   local max_scan = 0
   if args[3] ~= nil then
     max_scan = tonumber(args[3])
     if not is_int(max_scan) or max_scan < 0 or max_scan > MAX_SAFE_INT then
-      return redis.error_reply('PQ ESCAN: max_scan must be a non-negative integer')
+      return rerr('PQ ESCAN: max_scan must be a non-negative integer')
     end
   end
 
   local qtag = hash_tag(queue)
   local ptag = hash_tag(prefix)
   if qtag == nil or ptag == nil or qtag ~= ptag then
-    return redis.error_reply('PQ ETAG: keys must share one hash tag')
+    return rerr('PQ ETAG: keys must share one hash tag')
   end
   if dlq ~= nil then
     local dtag = hash_tag(dlq)
     if dtag == nil or dtag ~= qtag then
-      return redis.error_reply('PQ ETAG: keys must share one hash tag')
+      return rerr('PQ ETAG: keys must share one hash tag')
     end
   end
 
-  if redis.call('EXISTS', queue) == 1 then
-    local qt = redis.call('TYPE', queue)
+  if rcall('EXISTS', queue) == 1 then
+    local qt = rcall('TYPE', queue)
     if qt.ok ~= 'zset' then
-      return redis.error_reply('PQ EMALFORMED: queue is not a sorted set')
+      return rerr('PQ EMALFORMED: queue is not a sorted set')
     end
   end
-  if dlq ~= nil and redis.call('EXISTS', dlq) == 1 then
-    local dt = redis.call('TYPE', dlq)
+  if dlq ~= nil and rcall('EXISTS', dlq) == 1 then
+    local dt = rcall('TYPE', dlq)
     if dt.ok ~= 'zset' then
-      return redis.error_reply('PQ EMALFORMED: dead-letter queue is not a sorted set')
+      return rerr('PQ EMALFORMED: dead-letter queue is not a sorted set')
     end
   end
 
   -- Cheap tier (O(1)/O(log N); no per-message reads).
-  local depth = redis.call('ZCARD', queue)
+  local depth = rcall('ZCARD', queue)
   local dlq_depth = 0
-  if dlq ~= nil then dlq_depth = redis.call('ZCARD', dlq) end
+  if dlq ~= nil then dlq_depth = rcall('ZCARD', dlq) end
   local front_priority = -1 -- -1 = empty queue
-  local front = redis.call('ZRANGE', queue, 0, 0, 'WITHSCORES')
+  local front = rcall('ZRANGE', queue, 0, 0, 'WITHSCORES')
   if front[2] ~= nil then front_priority = tonumber(front[2]) end
 
   local out = { 'depth', depth, 'dlq_depth', dlq_depth, 'front_priority', front_priority }
@@ -867,19 +881,19 @@ local function pq_stats(keys, args)
     -- Bounded state breakdown over the source-queue front (each message is
     -- exactly one of in_flight / delayed / available; dangling/malformed -> skipped).
     local available, in_flight, delayed, skipped = 0, 0, 0, 0
-    local members = redis.call('ZRANGE', queue, 0, max_scan - 1)
+    local members = rcall('ZRANGE', queue, 0, max_scan - 1)
     for _, member in ipairs(members) do
       local colon = string.find(member, ':', 1, true)
       local id = colon and string.sub(member, colon + 1) or member
       local mkey = prefix .. id
-      if redis.call('EXISTS', mkey) == 0 then
+      if rcall('EXISTS', mkey) == 0 then
         skipped = skipped + 1
       else
-        local mt = redis.call('TYPE', mkey)
+        local mt = rcall('TYPE', mkey)
         if mt.ok ~= 'hash' then
           skipped = skipped + 1
         else
-          local v = redis.call('HMGET', mkey, 'DirtyBit', 'ReadDateTime', 'VisibleAt')
+          local v = rcall('HMGET', mkey, 'DirtyBit', 'ReadDateTime', 'VisibleAt')
           if v[1] == false then
             skipped = skipped + 1
           elseif not lease_available(v[1], v[2], now, timeout) then
@@ -905,7 +919,7 @@ local function pq_stats(keys, args)
     -- Priority-ordered, so this is the min DeadLetteredAt over the scanned front,
     -- not necessarily the global oldest -> flagged via age_truncated).
     if dlq ~= nil then
-      local dmembers = redis.call('ZRANGE', dlq, 0, max_scan - 1)
+      local dmembers = rcall('ZRANGE', dlq, 0, max_scan - 1)
       local dlq_scanned = 0
       local min_dla = nil
       for _, member in ipairs(dmembers) do
@@ -913,8 +927,8 @@ local function pq_stats(keys, args)
         local colon = string.find(member, ':', 1, true)
         local id = colon and string.sub(member, colon + 1) or member
         local mkey = prefix .. id
-        if redis.call('EXISTS', mkey) == 1 then
-          local dla = tonumber(redis.call('HGET', mkey, 'DeadLetteredAt'))
+        if rcall('EXISTS', mkey) == 1 then
+          local dla = tonumber(rcall('HGET', mkey, 'DeadLetteredAt'))
           if dla ~= nil and dla > 0 and (min_dla == nil or dla < min_dla) then
             min_dla = dla
           end

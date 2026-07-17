@@ -20,8 +20,7 @@ class PqValidateContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void validate(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
 
       assertEquals("VALID", Pq.deep(Pq.fcallRo(j, "pq_validate", List.of(),
           "Priority", "5", "DirtyBit", "true")), "valid input -> VALID");

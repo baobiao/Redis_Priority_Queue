@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== dequeue concurrency on: $e =="
-  load_library "$e"
 
   q="pq:{n1}"; pfx="pq:{n1}:m:"
   engine_cli "$e" DEL "$q" "${pfx}m1" "${pfx}m2" >/dev/null
@@ -31,6 +28,6 @@ for e in $ENGINES; do
           echo "  FAIL : second consumer must not re-receive the leased message" ;;
     *)    TESTS_RUN=$((TESTS_RUN + 1)); echo "  ok   : leased message not re-delivered concurrently" ;;
   esac
-done
+}
 
-finish
+run_suite suite

@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== redrive validation on: $e =="
-  load_library "$e"
   q="pq:{uv}"; pfx="pq:{uv}:m:"; dl="dlq:{uv}"
   engine_cli "$e" DEL "$q" "$dl" "${pfx}X" "${pfx}Y" >/dev/null
 
@@ -42,6 +39,6 @@ for e in $ENGINES; do
   expect_contains "non-hash message -> EMALFORMED" "EMALFORMED" "$out"
   expect "no write: Y still in the DLQ" "5" "$(engine_cli "$e" ZSCORE "$dl" "$mY")"
   expect "no write: Y not added to the source" "" "$(engine_cli "$e" ZSCORE "$q" "$mY")"
-done
+}
 
-finish
+run_suite suite

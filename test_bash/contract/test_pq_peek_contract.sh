@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== peek contract on: $e =="
-  load_library "$e"
   q="pq:{pc}"; pfx="pq:{pc}:m:"
   engine_cli "$e" DEL "$q" "${pfx}k" >/dev/null
 
@@ -59,6 +56,6 @@ for e in $ENGINES; do
   expect "single peek skips not-yet-visible -> null" "" "$out"
   out=$(fcall_ro "$e" pq_peek 2 "$vq" "$vpfx" 9000 30000)
   expect_contains "single peek returns it once visible" "hid" "$out"
-done
+}
 
-finish
+run_suite suite

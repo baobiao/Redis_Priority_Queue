@@ -5,14 +5,11 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
 MAX=9007199254740992  # 2^53
 
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== VisibleAt field validation on: $e =="
-  load_library "$e"
 
   # Valid values accepted (validate is no-writes; create stores).
   for v in 0 1 1000 "$MAX"; do
@@ -45,6 +42,6 @@ for e in $ENGINES; do
   engine_cli "$e" DEL "q:{vf}:m:2" >/dev/null
   fcall "$e" pq_create 1 "q:{vf}:m:2" Priority 5 VisibleAt 12345 >/dev/null
   expect "valid VisibleAt stored" "12345" "$(engine_cli "$e" HGET "q:{vf}:m:2" VisibleAt)"
-done
+}
 
-finish
+run_suite suite

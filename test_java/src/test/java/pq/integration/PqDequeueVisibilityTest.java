@@ -27,8 +27,7 @@ class PqDequeueVisibilityTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void visibilityReclaimAndFencing(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{v1}";
       String pfx = "pq:{v1}:m:";
       String member = member(1, "v");

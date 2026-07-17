@@ -15,12 +15,9 @@ expect_absent() { # <label> <needle> <haystack>
   esac
 }
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== visibility composition on: $e =="
-  load_library "$e"
 
   # --- read exposes VisibleAt ---
   engine_cli "$e" DEL "q:{cm}:m:1" >/dev/null
@@ -74,6 +71,6 @@ for e in $ENGINES; do
   expect "redrive reset VisibleAt to 0" "0" "$(engine_cli "$e" HGET "${pfx}M" VisibleAt)"
   out=$(fcall "$e" pq_dequeue 2 "$q" "$pfx" 1 30000)
   expect_contains "redriven message is immediately deliverable" "PAY-M" "$out"
-done
+}
 
-finish
+run_suite suite

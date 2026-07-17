@@ -27,8 +27,7 @@ class PqNackVisibleAtValidationTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void nackVisibleAtValidation(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del(Q, PFX + "1");
       Pq.fcall(j, "pq_enqueue", List.of(Q, PFX + "1"), "1", "1", "Priority", "5", "Payload", "w");
       Pq.fcall(j, "pq_dequeue", List.of(Q, PFX), "1000", "30000"); // lease (token=1, DirtyBit=1)

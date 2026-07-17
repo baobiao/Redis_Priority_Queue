@@ -303,7 +303,7 @@ bash test_bash/harness/docker_engines.sh down
 ├── specs/                        # feature specs (001-message-format … 007-rename-and-polyglot-tests)
 ├── test_bash/                    # reference suite (Bash + docker exec)
 │   ├── run_all.sh                # convenience runner (all suites + static gate)
-│   ├── harness/                  # docker_engines.sh, load_and_call.sh, static_checks.sh
+│   ├── harness/                  # docker_engines.sh, load_and_call.sh, static_checks.sh, bench_pq.sh
 │   ├── contract/                 # KEYS/ARGV/return-shape/flags assertions
 │   ├── integration/              # end-to-end behaviour (enqueue/dequeue/dead-letter/visibility/…)
 │   └── unit/                     # validation edge cases
