@@ -14,12 +14,9 @@ expect_absent() { # <label> <needle> <haystack>
   esac
 }
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== peek validation on: $e =="
-  load_library "$e"
   q="pq:{pv}"; pfx="pq:{pv}:m:"
   engine_cli "$e" DEL "$q" "${pfx}a" >/dev/null
   fcall "$e" pq_enqueue 2 "$q" "${pfx}a" a 1 Priority 5 Payload hi >/dev/null
@@ -61,6 +58,6 @@ for e in $ENGINES; do
 
   # No writes happened anywhere: the read-only queue member is still present.
   expect "peek wrote nothing (member intact)" "5" "$(engine_cli "$e" ZSCORE "$q" "$(printf '%020d:%s' 1 a)")"
-done
+}
 
-finish
+run_suite suite

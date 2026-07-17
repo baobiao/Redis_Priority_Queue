@@ -26,8 +26,7 @@ class PqVisibilityComposeTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void readExposesVisibleAt(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("q:{cm}:m:1");
       Pq.fcall(j, "pq_create", List.of("q:{cm}:m:1"),
           "Priority", "5", "Payload", "hi", "VisibleAt", "90000");
@@ -41,8 +40,7 @@ class PqVisibilityComposeTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void backCompatFiveFieldMessage(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{bc}", pfx = "pq:{bc}:m:";
       j.del(q, pfx + "old");
       j.hset(pfx + "old", Map.of(
@@ -61,8 +59,7 @@ class PqVisibilityComposeTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void peekSingleSkipsTopNReports(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{pv}", pfx = "pq:{pv}:m:";
       j.del(q, pfx + "F");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "F"),
@@ -81,8 +78,7 @@ class PqVisibilityComposeTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void deadLetterDeferredThenRedriveResets(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{dv}", pfx = "pq:{dv}:m:", dl = "dlq:{dv}";
       j.del(q, dl, pfx + "M");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "M"), "M", "1", "Priority", "5", "Payload", "PAY-M");

@@ -20,8 +20,7 @@ class PqEnqueueContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void enqueue(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("pq:{c1}", "pq:{c1}:m:1");
 
       assertEquals("OK", Pq.deep(Pq.fcall(j, "pq_enqueue",

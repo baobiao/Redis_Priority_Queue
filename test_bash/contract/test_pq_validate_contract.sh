@@ -4,12 +4,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== pq_validate contract on: $e =="
-  load_library "$e"
 
   # No keys (numkeys 0), callable via FCALL_RO
   out=$(fcall_ro "$e" pq_validate 0 Priority 5 DirtyBit true)
@@ -23,6 +20,6 @@ for e in $ENGINES; do
 
   out=$(fcall_ro "$e" pq_validate 0 Nope 1 2>&1 || true)
   expect_contains "unknown -> EFIELD" "EFIELD: Nope" "$out"
-done
+}
 
-finish
+run_suite suite

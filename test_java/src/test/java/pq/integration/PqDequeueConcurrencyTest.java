@@ -23,8 +23,7 @@ class PqDequeueConcurrencyTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void concurrentConsumersDistinctMessages(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{n1}";
       String pfx = "pq:{n1}:m:";
       j.del(q, pfx + "m1", pfx + "m2");

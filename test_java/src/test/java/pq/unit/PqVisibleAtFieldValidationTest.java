@@ -26,8 +26,7 @@ class PqVisibleAtFieldValidationTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void visibleAtFieldValidation(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
 
       // Valid values accepted (validate is no-writes; create stores).
       for (String v : List.of("0", "1", "1000", MAX)) {

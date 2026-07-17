@@ -22,8 +22,7 @@ class PqEnqueueValidationTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void enqueueValidation(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del(Q, M);
 
       Pq.assertError("EID", () -> Pq.fcall(j, "pq_enqueue", List.of(Q, M), "", "1"));

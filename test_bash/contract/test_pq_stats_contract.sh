@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== stats contract on: $e =="
-  load_library "$e"
   q="pq:{sc}"; pfx="pq:{sc}:m:"; dl="dlq:{sc}"
   engine_cli "$e" DEL "$q" "$dl" "${pfx}1" >/dev/null
   fcall "$e" pq_enqueue 2 "$q" "${pfx}1" 1 1 Priority 5 Payload x >/dev/null
@@ -53,6 +50,6 @@ for e in $ENGINES; do
   out=$(fcall "$e" pq_stats 2 "$q" "$pfx" 1000 30000)
   expect_contains "stats callable via FCALL too" "depth" "$out"
   expect "stats wrote nothing (message unleased)" "0" "$(engine_cli "$e" HGET "${pfx}1" DirtyBit)"
-done
+}
 
-finish
+run_suite suite

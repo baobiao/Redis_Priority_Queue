@@ -23,8 +23,7 @@ class PqRetryBackoffTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void backoffDelaysRedelivery(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{bo}", pfx = "pq:{bo}:m:";
       j.del(q, pfx + "1");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "1"), "1", "1", "Priority", "5", "Payload", "work");
@@ -53,8 +52,7 @@ class PqRetryBackoffTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void plainNackImmediateAndFencing(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{bp}", pfx = "pq:{bp}:m:";
       j.del(q, pfx + "2");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "2"), "2", "1", "Priority", "5", "Payload", "w2");

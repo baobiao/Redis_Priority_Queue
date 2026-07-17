@@ -26,8 +26,7 @@ class PqRetentionTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void stampAndReapWindow(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{rt}", pfx = "pq:{rt}:m:", dl = "dlq:{rt}";
       j.del(q, dl, pfx + "7");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "7"), "7", "7", "Priority", "5", "Payload", "job");
@@ -53,8 +52,7 @@ class PqRetentionTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void boundedByLimit(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q2 = "pq:{rb}", pfx2 = "pq:{rb}:m:", dl2 = "dlq:{rb}";
       j.del(q2, dl2, pfx2 + "1", pfx2 + "2", pfx2 + "3");
       for (int i = 1; i <= 3; i++) {
@@ -74,8 +72,7 @@ class PqRetentionTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void danglingMemberCleaned(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q3 = "pq:{rd}", pfx3 = "pq:{rd}:m:", dl3 = "dlq:{rd}";
       j.del(q3, dl3);
       j.zadd(dl3, 5, String.format("%020d:%s", 9, "9")); // member with no Hash
@@ -88,8 +85,7 @@ class PqRetentionTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void redriveClearsDeadLetteredAt(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q4 = "pq:{rr}", pfx4 = "pq:{rr}:m:", dl4 = "dlq:{rr}";
       j.del(q4, dl4, pfx4 + "5");
       Pq.fcall(j, "pq_create", List.of(pfx4 + "5"),

@@ -27,8 +27,7 @@ class PqStatsContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void stats(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{sc}";
       String pfx = "pq:{sc}:m:";
       String h1 = "pq:{sc}:m:1";

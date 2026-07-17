@@ -20,8 +20,7 @@ class PqCreateContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void create(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("q:{c1}");
 
       assertEquals("OK", Pq.deep(Pq.fcall(j, "pq_create", List.of("q:{c1}"))),

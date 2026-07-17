@@ -8,12 +8,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== dead-letter on: $e =="
-  load_library "$e"
 
   # ---- Scenario A: cap reached -> moved to the DLQ, not delivered ----
   q="pq:{dlA}"; pfx="pq:{dlA}:m:"; dl="dlq:{dlA}"
@@ -90,6 +87,6 @@ for e in $ENGINES; do
   fcall "$e" pq_dequeue 3 "$q" "$pfx" "$dl" 3000 30000 0 2 >/dev/null   # dead-letter F (already in DLQ)
   expect "DLQ still holds exactly one F member (no duplicate)" "1" "$(engine_cli "$e" ZCARD "$dl")"
   expect "F removed from the source" "" "$(engine_cli "$e" ZSCORE "$q" "$mF")"
-done
+}
 
-finish
+run_suite suite

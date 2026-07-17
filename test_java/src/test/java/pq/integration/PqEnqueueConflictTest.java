@@ -25,8 +25,7 @@ class PqEnqueueConflictTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void occupiedMessageLocationEExists(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("pq:{x1}", "pq:{x1}:m:1");
       Pq.fcall(j, "pq_enqueue", List.of("pq:{x1}", "pq:{x1}:m:1"), "1", "1", "Priority", "5");
       long before = j.zcard("pq:{x1}");
@@ -41,8 +40,7 @@ class PqEnqueueConflictTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void wrongTypeQueueEMalformed(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("pq:{x2}", "pq:{x2}:m:1");
       j.set("pq:{x2}", "notazset");
       Pq.assertError("EMALFORMED",
@@ -54,8 +52,7 @@ class PqEnqueueConflictTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void alreadyEnqueuedMemberEQDup(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("pq:{x3}", "pq:{x3}:m:1", "pq:{x3}:m:2");
       Pq.fcall(j, "pq_enqueue", List.of("pq:{x3}", "pq:{x3}:m:1"), "dup", "7", "Priority", "5");
       long before = j.zcard("pq:{x3}");

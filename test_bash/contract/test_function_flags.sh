@@ -4,12 +4,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== function flags on: $e =="
-  load_library "$e"
 
   listing=$(engine_cli "$e" FUNCTION LIST WITHCODE 2>/dev/null || engine_cli "$e" FUNCTION LIST)
   expect_contains "library registered" "priority_queue" "$listing"
@@ -45,6 +42,6 @@ for e in $ENGINES; do
   fcall "$e" pq_create 1 "q:{flag}" >/dev/null
   out=$(fcall_ro "$e" pq_read 1 "q:{flag}")
   expect_contains "read works via FCALL_RO" "Priority" "$out"
-done
+}
 
-finish
+run_suite suite

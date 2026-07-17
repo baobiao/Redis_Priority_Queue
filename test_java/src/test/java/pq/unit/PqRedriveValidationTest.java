@@ -28,8 +28,7 @@ class PqRedriveValidationTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void redriveValidation(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del(Q, DL, PFX + "X", PFX + "Y");
 
       // Bad key count.
@@ -59,8 +58,7 @@ class PqRedriveValidationTest {
   void tagMismatch(Engines.Combo combo) {
     Assumptions.assumeTrue(combo.topology() == Engines.Topology.STANDALONE,
         "cross-slot ETAG check is standalone-only");
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       Pq.assertError("ETAG", () -> Pq.fcall(j, "pq_redrive",
           List.of("dlq:{uv}", "pq:{nope}", "pq:{uv}:m:X"), "anything"));
     }

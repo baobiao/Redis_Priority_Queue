@@ -25,8 +25,7 @@ class PqPeekTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void singleTopNAndCountOverSize(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{pk}", pfx = "pq:{pk}:m:";
       j.del(q, pfx + "A", pfx + "B", pfx + "C");
       // Front order by (priority, seq): B(pri5), A(pri10,seq1), C(pri10,seq3).
@@ -64,8 +63,7 @@ class PqPeekTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void emptyQueue(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String eq = "pq:{pke}", epfx = "pq:{pke}:m:";
       j.del(eq);
       Object out = Pq.fcallRo(j, "pq_peek", List.of(eq, epfx), "1000", "30000");
@@ -79,8 +77,7 @@ class PqPeekTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void allLeasedSingleNull(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String lq = "pq:{pkl}", lpfx = "pq:{pkl}:m:";
       j.del(lq, lpfx + "Z");
       Pq.fcall(j, "pq_enqueue", List.of(lq, lpfx + "Z"), "Z", "1", "Priority", "5", "Payload", "PAY-Z");
@@ -94,8 +91,7 @@ class PqPeekTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void danglingMemberSkippedNeverRemoved(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String dq = "pq:{pkd}", dpfx = "pq:{pkd}:m:";
       j.del(dq, dpfx + "D");
       Pq.fcall(j, "pq_enqueue", List.of(dq, dpfx + "D"), "D", "1", "Priority", "5", "Payload", "PAY-D");
@@ -111,8 +107,7 @@ class PqPeekTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void dlqShapedQueue(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String dl = "dlq:{pk2}", dlpfx = "dlq:{pk2}:m:";
       j.del(dl, dlpfx + "W");
       Pq.fcall(j, "pq_enqueue", List.of(dl, dlpfx + "W"), "W", "1", "Priority", "9", "Payload", "PAY-W");

@@ -25,8 +25,7 @@ class PqDeadletterTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void scenarioA_capReachedMovedToDlq(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{dlA}", pfx = "pq:{dlA}:m:", dl = "dlq:{dlA}";
       j.del(q, dl, pfx + "A");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "A"), "A", "1", "Priority", "5", "Payload", "PAY-A");
@@ -50,8 +49,7 @@ class PqDeadletterTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void scenarioB_belowCapDelivered(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{dlB}", pfx = "pq:{dlB}:m:", dl = "dlq:{dlB}";
       j.del(q, dl, pfx + "B");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "B"), "B", "1", "Priority", "5", "Payload", "PAY-B");
@@ -67,8 +65,7 @@ class PqDeadletterTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void scenarioC_inflightNotDeadletteredUntilExpired(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{dlC}", pfx = "pq:{dlC}:m:", dl = "dlq:{dlC}";
       j.del(q, dl, pfx + "C");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "C"), "C", "1", "Priority", "5", "Payload", "PAY-C");
@@ -94,8 +91,7 @@ class PqDeadletterTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void scenarioE_f003ParityNoDlqNeverDeadletters(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{dlE}", pfx = "pq:{dlE}:m:";
       j.del(q, pfx + "E");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "E"), "E", "1", "Priority", "5", "Payload", "PAY-E");
@@ -116,8 +112,7 @@ class PqDeadletterTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void scenarioF_noDuplicateInDlq(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{dlF}", pfx = "pq:{dlF}:m:", dl = "dlq:{dlF}";
       j.del(q, dl, pfx + "F");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "F"), "F", "1", "Priority", "7", "Payload", "PAY-F");

@@ -4,12 +4,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== pq_read contract on: $e =="
-  load_library "$e"
 
   engine_cli "$e" DEL "q:{r1}" "q:{absent}" "q:{wrong}" >/dev/null
   fcall "$e" pq_create 1 "q:{r1}" Payload hi Priority 9 >/dev/null
@@ -62,6 +59,6 @@ for e in $ENGINES; do
   out=$(fcall_ro "$e" pq_read 1 "q:{rlegacy6}")
   expect_contains "legacy message still reads (Payload)" "old2" "$out"
   expect_contains "legacy message reports DeadLetteredAt" "DeadLetteredAt" "$out"
-done
+}
 
-finish
+run_suite suite

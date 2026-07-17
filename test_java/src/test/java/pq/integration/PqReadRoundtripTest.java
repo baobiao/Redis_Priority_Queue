@@ -22,8 +22,7 @@ class PqReadRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void roundTripPreservesTypesAndReadDoesNotMutate(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
 
       // DirtyBit=false round-trips to integer 0 (not nil); large epoch preserved.
       j.del("q:{rt}");
@@ -47,8 +46,7 @@ class PqReadRoundtripTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void dirtyBitTrueStoredAsOne(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del("q:{rt2}");
       Pq.fcall(j, "pq_create", List.of("q:{rt2}"), "DirtyBit", "1");
       assertEquals("1", j.hget("q:{rt2}", "DirtyBit"), "DirtyBit true stored as 1");

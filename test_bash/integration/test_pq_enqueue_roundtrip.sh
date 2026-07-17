@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== enqueue round-trip on: $e =="
-  load_library "$e"
 
   # --- Priority ordering across distinct priorities, including boundary values ---
   engine_cli "$e" DEL "pq:{o1}" "pq:{o1}:m:low" "pq:{o1}:m:mid" "pq:{o1}:m:hi" \
@@ -44,6 +41,6 @@ for e in $ENGINES; do
   expect "omitted ReadAttempts defaulted" "0" "$(engine_cli "$e" HGET "pq:{r1}:m:1" ReadAttempts)"
   expect "omitted DirtyBit defaulted"     "0" "$(engine_cli "$e" HGET "pq:{r1}:m:1" DirtyBit)"
   expect "stored Priority field" "5" "$(engine_cli "$e" HGET "pq:{r1}:m:1" Priority)"
-done
+}
 
-finish
+run_suite suite

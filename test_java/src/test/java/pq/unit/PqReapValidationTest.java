@@ -26,8 +26,7 @@ class PqReapValidationTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void reapValidation(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       j.del(DL, PFX + "1");
       // Seed one clearly-expired entry; assert it survives every rejected call.
       Pq.fcall(j, "pq_create", List.of(PFX + "1"), "Priority", "5", "Payload", "x", "DeadLetteredAt", "1");
@@ -55,8 +54,7 @@ class PqReapValidationTest {
   void tagMismatch(Engines.Combo combo) {
     Assumptions.assumeTrue(combo.topology() == Engines.Topology.STANDALONE,
         "cross-slot ETAG check is standalone-only");
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       Pq.assertError("ETAG",
           () -> Pq.fcall(j, "pq_reap", List.of("dlq:{rv}", "pq:{nope}:m:"), "100000", "1000", "10"));
     }

@@ -28,8 +28,7 @@ class PqReapContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void reap(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String dl = "dlq:{rc}";
       String pfx = "pq:{rc}:m:";
       String h1 = "pq:{rc}:m:1";

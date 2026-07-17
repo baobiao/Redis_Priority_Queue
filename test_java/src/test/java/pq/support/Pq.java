@@ -39,6 +39,14 @@ public final class Pq {
     return j.functionLoadReplace(source());
   }
 
+  /** Connect a client for this combo and FUNCTION LOAD the library (mirrors the Bash
+   *  load_library step); use in a try-with-resources so the client is closed. */
+  public static UnifiedJedis connect(Engines.Combo combo) {
+    UnifiedJedis j = combo.connect();
+    load(j);
+    return j;
+  }
+
   public static Object fcall(UnifiedJedis j, String fn, List<String> keys, List<String> args) {
     return j.fcall(fn, keys, args);
   }

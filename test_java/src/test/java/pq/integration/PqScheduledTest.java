@@ -24,8 +24,7 @@ class PqScheduledTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void futureVisibleAtSkippedThenDelivered(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{sc}", pfx = "pq:{sc}:m:";
       j.del(q, pfx + "A");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "A"),
@@ -43,8 +42,7 @@ class PqScheduledTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void hiddenHighPriorityDoesNotBlockVisibleLow(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{sd}", pfx = "pq:{sd}:m:";
       j.del(q, pfx + "H", pfx + "L");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "H"),
@@ -65,8 +63,7 @@ class PqScheduledTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void visibleAtZeroAndOmitted(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{s0}", pfx = "pq:{s0}:m:";
       j.del(q, pfx + "Z", pfx + "Y");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "Z"),

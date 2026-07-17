@@ -6,12 +6,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== dequeue round-trip on: $e =="
-  load_library "$e"
 
   q="pq:{d1}"; pfx="pq:{d1}:m:"
   engine_cli "$e" DEL "$q" "${pfx}a" "${pfx}b" "${pfx}c" >/dev/null
@@ -58,6 +55,6 @@ for e in $ENGINES; do
   expect_contains "a redelivered after nack" "task-a" "$d5"
   expect "a ReadAttempts incremented to 2" "2"    "$(engine_cli "$e" HGET "${pfx}a" ReadAttempts)"
   expect "a ReadDateTime updated to 2000"  "2000" "$(engine_cli "$e" HGET "${pfx}a" ReadDateTime)"
-done
+}
 
-finish
+run_suite suite

@@ -7,12 +7,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== retention on: $e =="
-  load_library "$e"
 
   # --- Dead-letter stamps DeadLetteredAt; reap keeps within-window then removes ---
   q="pq:{rt}"; pfx="pq:{rt}:m:"; dl="dlq:{rt}"
@@ -63,6 +60,6 @@ for e in $ENGINES; do
   fcall "$e" pq_redrive 3 "$dl4" "$q4" "${pfx4}5" "$m5" >/dev/null
   expect "redrive clears DeadLetteredAt to 0" "0" "$(engine_cli "$e" HGET "${pfx4}5" DeadLetteredAt)"
   expect "redriven message back in source" "5" "$(engine_cli "$e" ZSCORE "$q4" "$m5")"
-done
+}
 
-finish
+run_suite suite

@@ -4,12 +4,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== read round-trip on: $e =="
-  load_library "$e"
 
   # DirtyBit=false round-trips to integer 0 (not nil); large epoch preserved.
   engine_cli "$e" DEL "q:{rt}" >/dev/null
@@ -30,6 +27,6 @@ for e in $ENGINES; do
   fcall_ro "$e" pq_read 1 "q:{rt}" >/dev/null
   after=$(engine_cli "$e" HGETALL "q:{rt}" | sort)
   expect "read does not mutate" "$before" "$after"
-done
+}
 
-finish
+run_suite suite

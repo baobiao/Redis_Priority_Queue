@@ -25,8 +25,7 @@ class PqRedriveTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void redriveResetsAndRedelivers(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{rd}", pfx = "pq:{rd}:m:", dl = "dlq:{rd}";
       j.del(q, dl, pfx + "G");
       Pq.fcall(j, "pq_enqueue", List.of(q, pfx + "G"), "G", "1", "Priority", "5", "Payload", "PAY-G");
@@ -58,8 +57,7 @@ class PqRedriveTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void rejectAlreadyInSource(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q2 = "pq:{rd2}", pfx2 = "pq:{rd2}:m:", dl2 = "dlq:{rd2}";
       j.del(q2, dl2, pfx2 + "H");
       Pq.fcall(j, "pq_enqueue", List.of(q2, pfx2 + "H"), "H", "1", "Priority", "5", "Payload", "PAY-H");

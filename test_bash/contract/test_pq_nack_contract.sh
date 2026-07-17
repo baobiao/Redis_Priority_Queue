@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== nack contract on: $e =="
-  load_library "$e"
   q="pq:{nc}"; pfx="pq:{nc}:m:"
   engine_cli "$e" DEL "$q" "${pfx}1" >/dev/null
 
@@ -49,6 +46,6 @@ for e in $ENGINES; do
   # Write function: rejected under FCALL_RO.
   out=$(fcall_ro "$e" pq_nack 1 "${pfx}1" 1 2>&1 || true)
   expect_contains "nack rejected via FCALL_RO" "Can not execute a script with write flag using *_ro command" "$out"
-done
+}
 
-finish
+run_suite suite

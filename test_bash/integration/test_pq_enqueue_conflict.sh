@@ -5,12 +5,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== enqueue conflicts on: $e =="
-  load_library "$e"
 
   # --- Occupied message location -> EEXISTS; existing message + queue unchanged ---
   engine_cli "$e" DEL "pq:{x1}" "pq:{x1}:m:1" >/dev/null
@@ -36,6 +33,6 @@ for e in $ENGINES; do
   expect_contains "already-enqueued member -> EQDUP" "EQDUP" "$out"
   expect "queue cardinality unchanged after EQDUP" "$before" "$(engine_cli "$e" ZCARD "pq:{x3}")"
   expect "second message hash not created after EQDUP" "0" "$(engine_cli "$e" EXISTS "pq:{x3}:m:2")"
-done
+}
 
-finish
+run_suite suite

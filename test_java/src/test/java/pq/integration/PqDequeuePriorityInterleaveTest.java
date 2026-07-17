@@ -25,8 +25,7 @@ class PqDequeuePriorityInterleaveTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void priorityInterleaveDoesNotPreemptInflight(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{pi1}";
       String pfx = "pq:{pi1}:m:";
       j.del(q, pfx + "A", pfx + "B", pfx + "C");

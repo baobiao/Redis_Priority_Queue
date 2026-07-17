@@ -22,8 +22,7 @@ class PqNackContractTest {
   @ParameterizedTest(name = "{0}")
   @MethodSource("pq.support.Engines#all")
   void nack(Engines.Combo combo) {
-    try (UnifiedJedis j = combo.connect()) {
-      Pq.load(j);
+    try (UnifiedJedis j = Pq.connect(combo)) {
       String q = "pq:{nc}";
       String m1 = "pq:{nc}:m:1";
       String pfx = "pq:{nc}:m:";

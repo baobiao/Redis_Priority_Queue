@@ -4,12 +4,9 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../harness/load_and_call.sh"
 
-ENGINES="${ENGINES:-redis valkey}"
-up >/dev/null
-
-for e in $ENGINES; do
+suite() {
+  local e="$1"
   echo "== validation rules on: $e =="
-  load_library "$e"
   engine_cli "$e" DEL "q:{bad}" >/dev/null
 
   out=$(fcall "$e" pq_create 1 "q:{bad}" ReadAttempts -1 2>&1 || true)
@@ -38,6 +35,6 @@ for e in $ENGINES; do
 
   # Nothing stored on any failure
   expect "no hash stored after failures" "0" "$(engine_cli "$e" EXISTS "q:{bad}")"
-done
+}
 
-finish
+run_suite suite
